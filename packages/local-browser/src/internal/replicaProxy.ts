@@ -29,6 +29,7 @@ import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
 import { boundedTtlMillis } from "./configuration.js"
 import { invalidConfiguration } from "./errors.js"
+import * as Invalidation from "./invalidation.js"
 import * as LosslessQueue from "./losslessQueue.js"
 import type * as replicaWire from "./replicaWire.js"
 import * as SequencedPubSub from "./sequencedPubSub.js"
@@ -232,11 +233,15 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
   let invalidationsLive = false
   const mintMutationId = Identity.makeMutationId.pipe(Effect.provideService(Crypto.Crypto, options.crypto))
 
+  const notify = (keys: ReadonlyArray<string>) => Invalidation.notify(options.reactivity, keys)
+
   const fullRefreshKeys = (): Array<string> => {
     const keys: Array<string> = [ReactivityKey.spaces, ReactivityKey.aggregateStatus]
     for (const spaceId of known) keys.push(ReactivityKey.membership(spaceId))
     return keys
   }
+
+  const refreshEverything = Effect.suspend(() => notify(fullRefreshKeys()))
 
   const dropMemberships = () => {
     membershipEpoch += 1
@@ -273,16 +278,16 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     Stream.runForEach((frame) => {
       if (frame._tag === "Keys") {
         forgetInvalidatedMemberships(frame.keys)
-        return options.reactivity.invalidate(frame.keys)
+        return notify(frame.keys)
       }
       if (frame._tag === "Overflow") {
         dropMemberships()
-        return options.reactivity.invalidate(fullRefreshKeys())
+        return refreshEverything
       }
       invalidationsLive = true
       if (resubscribing) {
         dropMemberships()
-        return options.reactivity.invalidate(fullRefreshKeys())
+        return refreshEverything
       }
       resubscribing = true
       return Deferred.succeed(subscribed, undefined)
@@ -295,7 +300,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
   yield* supersededSignal.pipe(
     Effect.andThen(Effect.suspend(() => {
       forgetMemberships()
-      return options.reactivity.invalidate(fullRefreshKeys())
+      return refreshEverything
     })),
     Effect.forkIn(proxyScope)
   )
@@ -584,7 +589,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
         Effect.suspend(() => {
           acquisitions += 1
           if (acquisitions === 1) return Deferred.succeed(acquired, undefined)
-          return options.reactivity.invalidate([key])
+          return notify([key])
         })
       ),
       resubscribeAfterHandover,

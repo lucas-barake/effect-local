@@ -32,8 +32,10 @@ import * as Stream from "effect/Stream"
 import * as WorkflowEngine from "effect/workflow/WorkflowEngine"
 import * as ConnectionLane from "./ConnectionLane.js"
 import * as Codec from "./internal/codec.js"
+import * as Completion from "./internal/completion.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Errors from "./internal/errors.js"
+import * as Invalidation from "./internal/invalidation.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
@@ -126,6 +128,13 @@ type BaseRequirements<D extends Definition.Any,> =
 
 const operationPermits = Number.MAX_SAFE_INTEGER
 
+const CallerFiber = Context.Reference<number | undefined>("@lucas-barake/effect-local-sql/SqlReplica/CallerFiber", {
+  defaultValue: () => undefined
+})
+
+const onCallerFiber = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
+  Effect.withFiber((fiber) => Effect.provideService(effect, CallerFiber, fiber.id))
+
 interface ActiveRuntime {
   readonly foreground: boolean
   readonly scope: Scope.Closeable
@@ -145,14 +154,14 @@ interface RememberedEntry {
   handle: Replica.Space
   activation: Replica.Activation
   runtime: ActiveRuntime | undefined
-  transition: Deferred.Deferred<void, ReplicaError.ReplicaError> | undefined
+  transition: Completion.Completion<void, ReplicaError.ReplicaError> | undefined
   foreground: boolean
   foregroundDemand: number
-  settlementsRecorded: Deferred.Deferred<void>
+  settlementsRecorded: Completion.Completion<void>
   leases: number
   leaving: boolean
   dueWhileLeaving: boolean
-  leaveCompletion: Deferred.Deferred<void, ReplicaError.ReplicaError> | undefined
+  leaveCompletion: Completion.Completion<void, ReplicaError.ReplicaError> | undefined
   workflowRegistration: ReconciliationWorkflow.RegistrationService | undefined
   summaryStatus: ReplicaStatus.ReplicaStatus
   synced: boolean
@@ -256,7 +265,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         lane
       )
       const entries = new Map<Identity.SpaceId, RememberedEntry>()
-      const joining = new Map<Identity.SpaceId, Deferred.Deferred<void>>()
+      const joining = new Map<Identity.SpaceId, Completion.Completion<void>>()
       const foregroundResidents = new Map<Identity.SpaceId, RememberedEntry>()
       const foregroundAdmitted = new Set<Identity.SpaceId>()
       const dropForegroundReservation = (entry: RememberedEntry) => {
@@ -339,7 +348,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const leaveRejections = new WeakSet<ReplicaError.ReplicaError>()
       const credentialWaits = yield* FiberMap.make<Identity.MembershipIncarnation, void, never>()
       const retrySchedule: Array<RetryWork> = []
-      let capacityChanged = yield* Deferred.make<void>()
+      let capacityChanged = Completion.make<void>()
 
       const clientId = yield* Migrations.client({
         definition: options.definition,
@@ -354,39 +363,38 @@ const makeLayer = <D extends Definition.Any, R,>(
       const defaultScopeJson = yield* Codec.stringify(normalizedDefaultScope)
       const defaultScopeDigest = yield* Protocol.replicationScopeDigest(normalizedDefaultScope)
 
-      const invalidateAggregate = reactivity.invalidate([ReactivityKey.aggregateStatus])
-      const changeAggregate = (
-        update: (current: ReplicaStatus.Aggregate) => ReplicaStatus.Aggregate,
-        invalidate = true
-      ) => {
-        const changed = Ref.update(aggregate, update)
-        if (!invalidate) return changed.pipe(Effect.uninterruptible)
-        return changed.pipe(Effect.andThen(invalidateAggregate), Effect.uninterruptible)
-      }
-      const addContribution = (entry: RememberedEntry, invalidate = true) =>
-        changeAggregate((current) => {
+      const handOff = (keys: ReadonlyArray<string>) =>
+        Invalidation.flush(reactivity, keys, () => Effect.void).pipe(Effect.forkIn(parentScope), Effect.asVoid)
+      const flush = (keys: ReadonlyArray<string>) => Invalidation.flush(reactivity, keys, handOff)
+      const notify = (keys: ReadonlyArray<string>) =>
+        Effect.withFiber((fiber) => {
+          if (fiber.getRef(CallerFiber) === fiber.id) return Invalidation.notify(reactivity, keys, handOff)
+          return flush(keys)
+        })
+      const addContribution = (entry: RememberedEntry) =>
+        Ref.update(aggregate, (current) => {
           const category = statusCategory(entry.summaryStatus)
           return aggregateStatus(
             current.spaces + 1,
             current.totalPending + entry.summaryStatus.pending,
             { ...current.counts, [category]: current.counts[category] + 1 }
           )
-        }, invalidate)
+        })
       const removeContribution = (entry: RememberedEntry) =>
-        changeAggregate((current) => {
+        Ref.update(aggregate, (current) => {
           const category = statusCategory(entry.summaryStatus)
           return aggregateStatus(
             current.spaces - 1,
             current.totalPending - entry.summaryStatus.pending,
             { ...current.counts, [category]: current.counts[category] - 1 }
           )
-        }, false)
-      const modifyContribution = (
+        })
+      const applyContribution = (
         entry: RememberedEntry,
         update: (current: ReplicaStatus.ReplicaStatus) => ReplicaStatus.ReplicaStatus
       ) =>
         Effect.suspend(() => {
-          if (entries.get(entry.spaceId) !== entry || entry.leaving) return Effect.void
+          if (entries.get(entry.spaceId) !== entry || entry.leaving) return Effect.succeed(false)
           return Ref.modify(aggregate, (current): readonly [boolean, ReplicaStatus.Aggregate] => {
             const previous = entry.summaryStatus
             const next = update(previous)
@@ -410,28 +418,31 @@ const makeLayer = <D extends Definition.Any, R,>(
                 counts
               )
             ]
-          }).pipe(
-            Effect.flatMap((changed) => {
-              if (changed) return invalidateAggregate
-              return Effect.void
-            }),
-            Effect.uninterruptible
-          )
+          })
         })
-      const updateContribution = (
+      const announceContribution = (changed: boolean) => {
+        if (changed) return notify([ReactivityKey.aggregateStatus])
+        return Effect.void
+      }
+      const modifyContribution = (
         entry: RememberedEntry,
-        next: ReplicaStatus.ReplicaStatus
-      ) => modifyContribution(entry, () => next)
+        update: (current: ReplicaStatus.ReplicaStatus) => ReplicaStatus.ReplicaStatus
+      ) => applyContribution(entry, update).pipe(Effect.flatMap(announceContribution), Effect.uninterruptible)
+      const publishContribution = (changed: boolean) => {
+        if (changed) return flush([ReactivityKey.aggregateStatus])
+        return Effect.void
+      }
       const publishRuntimeStatus = (
         entry: RememberedEntry,
         next: ReplicaStatus.ReplicaStatus,
         pendingCounted: boolean
-      ) => {
-        if (pendingCounted) return updateContribution(entry, next)
-        return modifyContribution(entry, (current) => ({ ...next, pending: current.pending }))
-      }
-      const updatePendingContribution = (entry: RememberedEntry, pending: number) =>
-        modifyContribution(entry, (current) => ({ ...current, pending }))
+      ) =>
+        applyContribution(entry, (current) => {
+          if (pendingCounted) return next
+          return { ...next, pending: current.pending }
+        }).pipe(Effect.flatMap(publishContribution), Effect.uninterruptible)
+      const applyPendingContribution = (entry: RememberedEntry, pending: number) =>
+        applyContribution(entry, (current) => ({ ...current, pending }))
       const readMemberships = SqlSchema.findAll({
         Request: Schema.Void,
         Result: RememberedRow,
@@ -493,28 +504,28 @@ const makeLayer = <D extends Definition.Any, R,>(
         return yield* decodeScope(row.value.desired_scope_json)
       })
 
-      const signalCapacity = Effect.sync(() => {
+      const signalCapacity = Effect.suspend(() => {
         const previous = capacityChanged
-        capacityChanged = Deferred.makeUnsafe<void>()
-        Deferred.doneUnsafe(previous, Exit.void)
+        capacityChanged = Completion.make<void>()
+        return Completion.settle(previous, Exit.void)
       })
 
       const recordReplicationView = (entry: RememberedEntry, installed: boolean) =>
         Effect.suspend(() => {
           if (entry.synced === installed) return Effect.void
           entry.synced = installed
-          return reactivity.invalidate([ReactivityKey.status(entry.spaceId)])
+          return flush([ReactivityKey.status(entry.spaceId)])
         })
 
       const publishSettlements = (entry: RememberedEntry) =>
         Effect.suspend(() => {
           const recorded = entry.settlementsRecorded
-          entry.settlementsRecorded = Deferred.makeUnsafe<void>()
-          return Deferred.succeed(recorded, undefined)
-        }).pipe(Effect.asVoid)
+          entry.settlementsRecorded = Completion.make<void>()
+          return Completion.settle(recorded, Exit.void)
+        })
 
       const invalidateActivation = (spaceId: Identity.SpaceId) =>
-        reactivity.invalidate([
+        notify([
           ReactivityKey.activation(spaceId),
           ReactivityKey.status(spaceId)
         ])
@@ -548,12 +559,17 @@ const makeLayer = <D extends Definition.Any, R,>(
           clientId,
           scope: replicationScope,
           spaceId,
+          handOffInvalidation: handOff,
           onSettlementsRecorded: publishSettlements(entry),
           onReplicationView: (installed) => recordReplicationView(entry, installed),
           onMutationsCommitted: (pending) =>
-            updatePendingContribution(entry, pending).pipe(
-              Effect.andThen(Deferred.await(reconcilerReady)),
-              Effect.flatMap((ready) => ready.schedule)
+            applyPendingContribution(entry, pending).pipe(
+              Effect.flatMap((changed) =>
+                Deferred.await(reconcilerReady).pipe(
+                  Effect.flatMap((ready) => ready.schedule),
+                  Effect.ensuring(publishContribution(changed))
+                )
+              )
             )
         }).pipe(Layer.provide(layerMutationRuntime))
         const layerQueryExecutor = QueryExecutor.layer(options.definition, spaceId)
@@ -724,7 +740,7 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const publishBackgroundFailure = (entry: RememberedEntry) =>
         Effect.suspend(() => {
-          const invalidateStatus = reactivity.invalidate([ReactivityKey.status(entry.spaceId)])
+          const invalidateStatus = notify([ReactivityKey.status(entry.spaceId)])
           if (entry.activation !== "Inactive") return invalidateStatus
           return modifyContribution(entry, (current) => inactiveStatus(entry, current.pending)).pipe(
             Effect.andThen(invalidateStatus)
@@ -868,7 +884,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (entry.activation === "Inactive") return false
           if (entry.activation === "Activating" || entry.activation === "Deactivating") {
             const pending = entry.transition
-            if (pending !== undefined) yield* restore(Deferred.await(pending))
+            if (pending !== undefined) yield* restore(Completion.wait(pending))
             return yield* deactivate(entry, explicit, expectedRuntime, enqueuePending)
           }
           const runtime = entry.runtime
@@ -884,22 +900,22 @@ const makeLayer = <D extends Definition.Any, R,>(
             if (!explicit) return false
             const changed = capacityChanged
             yield* Deferred.succeed(runtime.preemption, undefined)
-            yield* restore(Deferred.await(changed))
+            yield* restore(Completion.wait(changed))
             return yield* deactivate(entry, explicit, expectedRuntime, enqueuePending)
           }
-          const completion = Deferred.makeUnsafe<void, ReplicaError.ReplicaError>()
+          const completion = Completion.make<void, ReplicaError.ReplicaError>()
           entry.activation = "Deactivating"
           entry.transition = completion
           dropForegroundReservation(entry)
+          yield* signalCapacity
           yield* invalidateActivation(entry.spaceId)
           const shutdown = Scope.close(runtime.scope, Exit.void)
           const result = yield* runtime.operationGate.withPermits(operationPermits)(shutdown).pipe(Effect.exit)
           entry.runtime = undefined
           entry.activation = "Inactive"
           entry.transition = undefined
-          yield* Deferred.done(completion, result)
           yield* invalidateActivation(entry.spaceId)
-          yield* signalCapacity
+          yield* Completion.settle(completion, result)
           if (Exit.isFailure(result)) {
             yield* result
             return false
@@ -927,8 +943,12 @@ const makeLayer = <D extends Definition.Any, R,>(
               return Effect.void
             })
           )
-          yield* updateContribution(entry, inactiveStatus(entry, count.count))
+          let changed = false
+          if (entry.activation === "Inactive") {
+            changed = yield* applyContribution(entry, () => inactiveStatus(entry, count.count))
+          }
           if (enqueuePending && count.count > 0) yield* enqueueBackground(entry)
+          yield* announceContribution(changed)
           return true
         }))
 
@@ -955,7 +975,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             return deactivate(victim, false).pipe(Effect.andThen(ensureForegroundCapacity(entry)))
           }
           const changed = capacityChanged
-          return Deferred.await(changed).pipe(Effect.andThen(ensureForegroundCapacity(entry)))
+          return Completion.wait(changed).pipe(Effect.andThen(ensureForegroundCapacity(entry)))
         })
 
       const releaseForegroundReservation = (entry: RememberedEntry) =>
@@ -997,17 +1017,17 @@ const makeLayer = <D extends Definition.Any, R,>(
             if (entry.leases > 0) {
               const changed = capacityChanged
               yield* Deferred.succeed(entry.runtime.preemption, undefined)
-              yield* restore(Deferred.await(changed))
+              yield* restore(Completion.wait(changed))
               return yield* transition(entry, foreground)
             }
             retiring = entry.runtime
           } else if (entry.activation === "Activating" || entry.activation === "Deactivating") {
             const pending = entry.transition
-            if (pending !== undefined) yield* restore(Deferred.await(pending))
+            if (pending !== undefined) yield* restore(Completion.wait(pending))
             return yield* transition(entry, foreground)
           }
           if (foreground && !entry.foreground) return yield* transition(entry, foreground)
-          const completion = Deferred.makeUnsafe<void, ReplicaError.ReplicaError>()
+          const completion = Completion.make<void, ReplicaError.ReplicaError>()
           const generation = ++nextGeneration
           entry.activation = "Activating"
           entry.transition = completion
@@ -1037,7 +1057,9 @@ const makeLayer = <D extends Definition.Any, R,>(
                         })
                       )
                   }),
-                  Effect.flatMap((count) => updateContribution(entry, { _tag: "Connecting", pending: count.count }))
+                  Effect.flatMap((count) =>
+                    modifyContribution(entry, () => ({ _tag: "Connecting", pending: count.count }))
+                  )
                 )
               )),
               Effect.andThen(startRuntime)
@@ -1049,20 +1071,21 @@ const makeLayer = <D extends Definition.Any, R,>(
             entry.activation = "Active"
             entry.transition = undefined
             if (foreground) entry.backgroundGeneration += 1
-            yield* Deferred.succeed(completion, undefined)
-            yield* invalidateActivation(entry.spaceId)
             yield* signalCapacity
+            yield* invalidateActivation(entry.spaceId)
+            yield* Completion.settle(completion, Exit.void)
             return result.value
           }
           entry.activation = "Inactive"
           entry.transition = undefined
           dropForegroundReservation(entry)
-          yield* modifyContribution(entry, (current) => inactiveStatus(entry, current.pending))
-          if (Exit.hasInterrupts(result)) yield* Deferred.succeed(completion, undefined)
-          else yield* Deferred.done(completion, result)
-          yield* invalidateActivation(entry.spaceId)
-          yield* signalCapacity
+          const changed = yield* applyContribution(entry, (current) => inactiveStatus(entry, current.pending))
           if (retiring !== undefined) yield* enqueueBackground(entry)
+          yield* signalCapacity
+          yield* announceContribution(changed)
+          yield* invalidateActivation(entry.spaceId)
+          if (Exit.hasInterrupts(result)) yield* Completion.settle(completion, Exit.void)
+          else yield* Completion.settle(completion, Exit.asVoid(result))
           return yield* result
         }))
 
@@ -1130,7 +1153,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         withLease(entry, true, (runtime) => {
           const operation = checkRuntime(entry, runtime).pipe(Effect.andThen(use(runtime)))
           return runtime.operationGate.withPermit(operation)
-        })
+        }).pipe(onCallerFiber)
 
       const withResidentRuntime = <A, E extends { readonly _tag: string },>(
         entry: RememberedEntry,
@@ -1175,7 +1198,7 @@ const makeLayer = <D extends Definition.Any, R,>(
                     if (settled.length > 0) {
                       return [settled, Option.some<number>(settled[settled.length - 1].sequence)] as const
                     }
-                    yield* Deferred.await(recorded)
+                    yield* Completion.wait(recorded)
                   }
                 })
               )
@@ -1197,6 +1220,12 @@ const makeLayer = <D extends Definition.Any, R,>(
           canceled = yield* runtime.local.resolveQuarantine(canceledReceipt, "Discard")
         }
       })
+
+      const recountPending = (entry: RememberedEntry, runtime: ActiveRuntime) =>
+        runtime.local.pendingCount.pipe(
+          Effect.flatMap((pending) => applyPendingContribution(entry, pending)),
+          Effect.flatMap((changed) => Effect.ensuring(runtime.reconciler.notify, announceContribution(changed)))
+        )
 
       const findReceipt = (runtime: ActiveRuntime, mutationId: Identity.MutationId) =>
         runtime.local.receipt(mutationId).pipe(
@@ -1225,7 +1254,8 @@ const makeLayer = <D extends Definition.Any, R,>(
               Effect.flatMap(() => deactivate(entry, true)),
               Effect.andThen(activate(entry, true)),
               Effect.flatMap((runtime) => runtime.reconciler.notify),
-              Effect.andThen(reactivity.invalidate([ReactivityKey.scope(entry.spaceId)]))
+              Effect.andThen(notify([ReactivityKey.scope(entry.spaceId)])),
+              onCallerFiber
             ),
           activation: Effect.suspend(() => {
             if (entries.get(entry.spaceId) !== entry || entry.leaving) {
@@ -1233,8 +1263,8 @@ const makeLayer = <D extends Definition.Any, R,>(
             }
             return Effect.succeed(entry.activation)
           }),
-          activate: activate(entry, true).pipe(Effect.asVoid),
-          deactivate: deactivate(entry, true).pipe(Effect.asVoid),
+          activate: activate(entry, true).pipe(Effect.asVoid, onCallerFiber),
+          deactivate: deactivate(entry, true).pipe(Effect.asVoid, onCallerFiber),
           mutate: (mutation, payload, mutateOptions) =>
             withActive(entry, (runtime) => runtime.local.mutate(mutation, payload, mutateOptions)),
           get: (model, key) => withActive(entry, (runtime) => runtime.local.get(model, key)),
@@ -1288,13 +1318,7 @@ const makeLayer = <D extends Definition.Any, R,>(
                 })()
               ).pipe(
                 Effect.exit,
-                Effect.flatMap((exit) =>
-                  runtime.local.pendingCount.pipe(
-                    Effect.flatMap((pending) => updatePendingContribution(entry, pending)),
-                    Effect.andThen(runtime.reconciler.notify),
-                    Effect.andThen(exit)
-                  )
-                )
+                Effect.flatMap((exit) => Effect.andThen(recountPending(entry, runtime), exit))
               )),
           resubmitQuarantined: <M extends Mutation.Any,>(
             mutationId: Identity.MutationId,
@@ -1328,13 +1352,7 @@ const makeLayer = <D extends Definition.Any, R,>(
                 })()
               ).pipe(
                 Effect.exit,
-                Effect.flatMap((exit) =>
-                  runtime.local.pendingCount.pipe(
-                    Effect.flatMap((pending) => updatePendingContribution(entry, pending)),
-                    Effect.andThen(runtime.reconciler.notify),
-                    Effect.andThen(exit)
-                  )
-                )
+                Effect.flatMap((exit) => Effect.andThen(recountPending(entry, runtime), exit))
               )),
           status: Effect.suspend(() => {
             const runtime = entry.runtime
@@ -1387,7 +1405,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           transition: undefined,
           foreground: false,
           foregroundDemand: 0,
-          settlementsRecorded: Deferred.makeUnsafe<void>(),
+          settlementsRecorded: Completion.make<void>(),
           leases: 0,
           leaving: false,
           dueWhileLeaving: false,
@@ -1466,15 +1484,15 @@ const makeLayer = <D extends Definition.Any, R,>(
             const current = entries.get(spaceId)
             if (current !== undefined && !current.leaving) return current.handle
             if (current?.leaveCompletion !== undefined) {
-              yield* restore(Deferred.await(current.leaveCompletion))
+              yield* restore(Completion.wait(current.leaveCompletion))
               return yield* join(spaceId)
             }
             const activeJoin = joining.get(spaceId)
             if (activeJoin !== undefined) {
-              yield* restore(Deferred.await(activeJoin))
+              yield* restore(Completion.wait(activeJoin))
               return yield* join(spaceId)
             }
-            const completion = yield* Deferred.make<void>()
+            const completion = Completion.make<void>()
             joining.set(spaceId, completion)
             const result = yield* restore(
               lane.withTransaction(insertMembership(spaceId)).pipe(
@@ -1501,21 +1519,22 @@ const makeLayer = <D extends Definition.Any, R,>(
                       })
                     ),
                   onSome: createEntry
-                })),
-                Effect.tap((entry) => {
-                  entries.set(spaceId, entry)
-                  return addContribution(entry).pipe(
-                    Effect.andThen(reactivity.invalidate([
-                      ReactivityKey.membership(spaceId),
-                      ReactivityKey.spaces
-                    ]))
-                  )
-                })
+                }))
               )
             ).pipe(Effect.exit)
             if (joining.get(spaceId) === completion) joining.delete(spaceId)
-            yield* Deferred.succeed(completion, undefined)
-            return yield* result.pipe(Effect.map((entry) => entry.handle))
+            if (Exit.isFailure(result)) {
+              yield* Completion.settle(completion, Exit.void)
+              return yield* Effect.failCause(result.cause)
+            }
+            entries.set(spaceId, result.value)
+            yield* addContribution(result.value)
+            const announced = yield* restore(
+              notify([ReactivityKey.aggregateStatus, ReactivityKey.membership(spaceId), ReactivityKey.spaces])
+            ).pipe(Effect.exit)
+            yield* Completion.settle(completion, Exit.void)
+            yield* announced
+            return result.value.handle
           })
         )
 
@@ -1523,12 +1542,12 @@ const makeLayer = <D extends Definition.Any, R,>(
         Effect.uninterruptibleMask(Effect.fnUntraced(function*(restore) {
           const activeJoin = joining.get(spaceId)
           if (activeJoin !== undefined) {
-            yield* restore(Deferred.await(activeJoin))
+            yield* restore(Completion.wait(activeJoin))
             return yield* leave(spaceId)
           }
           const current = entries.get(spaceId)
           if (current?.leaveCompletion !== undefined) {
-            return yield* restore(Deferred.await(current.leaveCompletion))
+            return yield* restore(Completion.wait(current.leaveCompletion))
           }
           if (current === undefined) {
             return yield* restore(
@@ -1540,7 +1559,7 @@ const makeLayer = <D extends Definition.Any, R,>(
               )
             )
           }
-          const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
+          const completion = Completion.make<void, ReplicaError.ReplicaError>()
           current.leaving = true
           current.leaveCompletion = completion
           const cleanup = Effect.suspend(() => current.runtime?.cancelReconciliation ?? Effect.void).pipe(
@@ -1555,14 +1574,9 @@ const makeLayer = <D extends Definition.Any, R,>(
             Effect.tap(() => {
               entries.delete(spaceId)
               current.backgroundGeneration += 1
-              const announced = Effect.ensuring(
-                invalidateAggregate,
-                reactivity.invalidate([ReactivityKey.membership(spaceId), ReactivityKey.spaces])
-              )
               return removeContribution(current).pipe(
                 Effect.andThen(FiberMap.remove(credentialWaits, current.membershipIncarnation)),
-                Effect.andThen(publishSettlements(current)),
-                Effect.andThen(announced)
+                Effect.andThen(publishSettlements(current))
               )
             }),
             Effect.asVoid,
@@ -1570,17 +1584,23 @@ const makeLayer = <D extends Definition.Any, R,>(
               Effect.suspend(() => {
                 current.leaving = false
                 current.leaveCompletion = undefined
-                if (!current.dueWhileLeaving) return Effect.void
+                let republished = Effect.void
+                if (current.activation === "Inactive") {
+                  republished = modifyContribution(current, (summary) => inactiveStatus(current, summary.pending))
+                }
+                if (!current.dueWhileLeaving) return republished
                 current.dueWhileLeaving = false
-                return enqueueBackground(current)
+                return Effect.andThen(republished, enqueueBackground(current))
               })
             ),
-            Effect.exit,
-            Effect.tap((exit) => Deferred.done(completion, exit)),
-            Effect.asVoid
+            Effect.andThen(
+              notify([ReactivityKey.aggregateStatus, ReactivityKey.membership(spaceId), ReactivityKey.spaces])
+            ),
+            Effect.onExit((exit) => Completion.settle(completion, exit)),
+            Effect.exit
           )
           yield* Effect.forkIn(cleanup, parentScope, { startImmediately: true })
-          return yield* restore(Deferred.await(completion))
+          return yield* restore(Completion.wait(completion))
         }))
 
       const space = (spaceId: Identity.SpaceId) =>
@@ -1722,7 +1742,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       for (const row of restored) {
         const entry = yield* createEntry(row)
         entries.set(row.space_id, entry)
-        yield* addContribution(entry, false)
+        yield* addContribution(entry)
       }
       const configured: Array<Identity.SpaceId> = []
       if (options.initialSpaces !== undefined) configured.push(...options.initialSpaces)
@@ -1733,7 +1753,13 @@ const makeLayer = <D extends Definition.Any, R,>(
         if (entry !== undefined && row.count > 0) yield* enqueueBackground(entry)
       }
 
-      return Replica.Replica.of({ join, leave, spaces, space, status })
+      return Replica.Replica.of({
+        join: (spaceId) => onCallerFiber(join(spaceId)),
+        leave,
+        spaces,
+        space,
+        status
+      })
     })
   ).pipe(Layer.provideMerge(layerQueryReactivity))
 }

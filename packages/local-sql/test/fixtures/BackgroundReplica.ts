@@ -4,7 +4,9 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
@@ -12,6 +14,8 @@ import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
+import * as Logger from "effect/Logger"
+import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Scope from "effect/Scope"
@@ -23,6 +27,7 @@ import * as WorkflowEngine from "effect/workflow/WorkflowEngine"
 import * as SqlReplica from "../../src/SqlReplica.js"
 import * as SyncEngine from "../../src/SyncEngine.js"
 import * as Domain from "../Domain.js"
+import * as VirtualTime from "./DeterministicTime.js"
 
 export const viewId = Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000801")
 
@@ -174,10 +179,13 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     retryDelay: settings.retryDelay,
     maximumRetryDelay: settings.maximumRetryDelay
   } satisfies SqlReplica.Options<typeof Domain.definition>
+  let invalidationOutcome:
+    | { readonly key: string; readonly outcome: Effect.Effect<void, ReplicaError.ReplicaError> }
+    | undefined
   let heldInvalidation:
     | {
       readonly key: string
-      remaining: number
+      readonly matches: (fiberId: number) => Effect.Effect<boolean>
       readonly entered: Deferred.Deferred<void>
       readonly release: Deferred.Deferred<void>
     }
@@ -186,16 +194,21 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     get: (target, property, receiver) => {
       if (property !== "invalidate") return Reflect.get(target, property, receiver)
       return (keys: Parameters<typeof reactivity.invalidate>[0]) => {
+        const replaced = invalidationOutcome
+        if (replaced !== undefined && Array.isArray(keys) && keys.includes(replaced.key)) return replaced.outcome
         const held = heldInvalidation
         if (held === undefined || !Array.isArray(keys) || !keys.includes(held.key)) {
           return target.invalidate(keys)
         }
-        held.remaining -= 1
-        if (held.remaining > 0) return target.invalidate(keys)
-        heldInvalidation = undefined
-        return target.invalidate(keys).pipe(
-          Effect.andThen(Deferred.succeed(held.entered, undefined)),
-          Effect.andThen(Deferred.await(held.release))
+        return Effect.withFiber((fiber) => held.matches(fiber.id)).pipe(
+          Effect.flatMap((matched) => {
+            if (!matched || heldInvalidation !== held) return target.invalidate(keys)
+            heldInvalidation = undefined
+            return target.invalidate(keys).pipe(
+              Effect.andThen(Deferred.succeed(held.entered, undefined)),
+              Effect.andThen(Deferred.await(held.release))
+            )
+          })
         )
       }
     }
@@ -232,12 +245,42 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     const entered = yield* Deferred.make<void>()
     const release = yield* Deferred.make<void>()
     const arm = (remaining: number) => {
-      heldInvalidation = { key, remaining, entered, release }
+      let left = remaining
+      const matches = () =>
+        Effect.sync(() => {
+          left -= 1
+          return left <= 0
+        })
+      heldInvalidation = { key, matches, entered, release }
     }
     return { arm, entered: Deferred.await(entered), release: Deferred.succeed(release, undefined) }
   })
+  const holdInvalidationWhen = Effect.fnUntraced(function*(
+    key: string,
+    matches: (fiberId: number) => Effect.Effect<boolean>
+  ) {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    heldInvalidation = { key, matches, entered, release }
+    return { entered: Deferred.await(entered), release: Deferred.succeed(release, undefined) }
+  })
+  const endInvalidationsWith = (key: string, outcome: Effect.Effect<void, ReplicaError.ReplicaError>) => {
+    invalidationOutcome = { key, outcome }
+  }
   const lockRemaining = () => locked?.remaining ?? 0
-  return { sql, crypto, reactivity, start, lockNext, lockRemaining, dieNext, holdStatement, holdInvalidation }
+  return {
+    sql,
+    crypto,
+    reactivity,
+    start,
+    lockNext,
+    lockRemaining,
+    dieNext,
+    holdStatement,
+    holdInvalidation,
+    holdInvalidationWhen,
+    endInvalidationsWith
+  }
 })
 
 export type Services = Effect.Success<ReturnType<typeof services>>
@@ -285,3 +328,56 @@ export const awaitSpaceStatus = (
   reactivity: Reactivity.Reactivity,
   tag: ReplicaStatus.ReplicaStatus["_tag"]
 ) => awaitSpaceStatusWhere(space, reactivity, (status) => status._tag === tag)
+
+export const eventually = (
+  background: Services,
+  space: Replica.Space,
+  matches: (status: ReplicaStatus.SpaceStatus) => boolean
+) =>
+  awaitSpaceStatusWhere(space, background.reactivity, matches).pipe(
+    Effect.scoped,
+    VirtualTime.advanceUntil,
+    Effect.timeoutOption("5 minutes")
+  )
+
+export const within = <A, E extends { readonly _tag: string },>(effect: Effect.Effect<A, E>) =>
+  effect.pipe(Effect.exit, Effect.timeoutOption("5 minutes"), VirtualTime.advanceUntil)
+
+export const isOnlineDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
+
+export const healthyRemote = (background: Services) =>
+  SyncEngine.SyncEngine.of({
+    ...idleRemote,
+    submitBatch: acceptSubmission,
+    pull: (request) => emptyPage(background.crypto, request)
+  })
+
+export const installView = (background: Services) =>
+  background.sql`UPDATE effect_local_client_spaces SET replication_view_id = ${viewId}, replication_view_revision = 0`
+
+export const count = (background: Services, key: string) => {
+  let delivered = 0
+  background.reactivity.registerUnsafe([key], () => {
+    delivered += 1
+  })
+  return () => delivered
+}
+
+export const captureErrors = () => {
+  const messages: Array<string> = []
+  const logger = Logger.make<unknown, void>((entry) => {
+    if (entry.logLevel !== "Error") return
+    let message: unknown = entry.message
+    if (Array.isArray(message)) message = message[0]
+    messages.push(String(message))
+  })
+  return { layerLogs: Logger.layer([logger]), messages: () => messages }
+}
+
+export const describeExit = <A, E extends { readonly _tag: string },>(exit: Option.Option<Exit.Exit<A, E>>) => {
+  if (Option.isNone(exit)) return "never completed"
+  if (Exit.isSuccess(exit.value)) return "succeeded"
+  if (Cause.hasInterrupts(exit.value.cause)) return "interrupted"
+  if (Cause.hasDies(exit.value.cause)) return "died"
+  return "failed"
+}

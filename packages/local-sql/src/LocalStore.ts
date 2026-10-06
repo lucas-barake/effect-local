@@ -32,7 +32,9 @@ import * as ConnectionLane from "./ConnectionLane.js"
 import * as ClientLineage from "./internal/clientLineage.js"
 import * as ClientMetrics from "./internal/clientMetrics.js"
 import * as Codec from "./internal/codec.js"
+import * as Completion from "./internal/completion.js"
 import * as Configuration from "./internal/configuration.js"
+import * as Invalidation from "./internal/invalidation.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as PriorityLock from "./internal/priorityLock.js"
@@ -65,6 +67,7 @@ export interface Options {
   readonly maximumSettlementSnapshotBytes?: number
   readonly retainedMutationIds?: number
   readonly migration: Migrations.Options
+  readonly handOffInvalidation?: (keys: ReadonlyArray<string>) => Effect.Effect<void>
   readonly onSettlementsRecorded?: Effect.Effect<void>
   readonly onReplicationView?: (installed: boolean) => Effect.Effect<void>
   readonly onMutationsCommitted?: (pending: number) => Effect.Effect<void, ReplicaError.ReplicaError>
@@ -1631,13 +1634,17 @@ export const layer = (
         }
         return Array.from(new Set(keys))
       })
+      const invalidationScope = yield* Effect.scope
+      const handOffInvalidation = options.handOffInvalidation ?? ((keys: ReadonlyArray<string>) =>
+        Invalidation.flush(reactivity, keys, () => Effect.void).pipe(Effect.forkIn(invalidationScope), Effect.asVoid))
+      const notify = (keys: ReadonlyArray<string>) => Invalidation.flush(reactivity, keys, handOffInvalidation)
       const invalidate = (
         entities: ReadonlyArray<Protocol.EntityKey>,
         receiptIds: ReadonlyArray<Identity.MutationId> = [],
         pendingChanged = false
       ) =>
         prepareInvalidation(entities, receiptIds, pendingChanged).pipe(
-          Effect.flatMap(reactivity.invalidate)
+          Effect.flatMap(notify)
         )
 
       const deferredEntities = new Map<string, Protocol.EntityKey>()
@@ -1664,7 +1671,7 @@ export const layer = (
           return yield* Effect.succeed(Option.none<{
             readonly entities: ReadonlyArray<Protocol.EntityKey>
             readonly receiptIds: ReadonlyArray<Identity.MutationId>
-            readonly keys: ReadonlyArray<unknown>
+            readonly keys: ReadonlyArray<string>
           }>())
         }
         const keys = yield* prepareInvalidation(entities, receiptIds, deferredPendingChanged)
@@ -1674,11 +1681,11 @@ export const layer = (
         prepared: Option.Option<{
           readonly entities: ReadonlyArray<Protocol.EntityKey>
           readonly receiptIds: ReadonlyArray<Identity.MutationId>
-          readonly keys: ReadonlyArray<unknown>
+          readonly keys: ReadonlyArray<string>
         }>
       ) {
         if (Option.isNone(prepared)) return yield* Effect.void
-        yield* reactivity.withBatch(reactivity.invalidate(prepared.value.keys))
+        yield* notify(prepared.value.keys)
         for (const entity of prepared.value.entities) {
           deferredEntities.delete(SqlTransaction.entityKey(entity))
         }
@@ -2735,14 +2742,13 @@ export const layer = (
           Effect.tapError(() => {
             if (Option.isNone(page)) return Effect.void
             return projectSettlements(page, []).pipe(
-              Effect.flatMap((entities) => invalidate(entities)),
-              reactivity.withBatch
+              Effect.flatMap((entities) => invalidate(entities))
             )
           })
         )
         const settled = Array.from(touched.values())
         const entities = yield* projectSettlements(page, settled)
-        let invalidationKeys: ReadonlyArray<unknown> = []
+        let invalidationKeys: ReadonlyArray<string> = []
         if (
           Option.isSome(page) || entities.length > 0 || prunedReceiptIds.length > 0 || settlements.length > 0
         ) {
@@ -2764,10 +2770,7 @@ export const layer = (
             ReactivityKey.status(options.spaceId)
           ]
         }
-        if (keys.length > 0) {
-          const uniqueKeys = Array.from(new Set(keys))
-          yield* reactivity.withBatch(reactivity.invalidate(uniqueKeys))
-        }
+        yield* notify(keys)
         return deletedSettlements
       })
       const settleReceiptsInGate = prepareSettlementsInGate.pipe(
@@ -3568,9 +3571,7 @@ export const layer = (
           yield* recordBootstrapInstallMetric
           const entities = yield* rebuildProjection
           const deletedSettlements = yield* deleteSettledPending(settlements)
-          yield* reactivity.withBatch(
-            invalidate(entities, prunedReceiptIds, pendingChanged || deletedSettlements.length > 0)
-          )
+          yield* invalidate(entities, prunedReceiptIds, pendingChanged || deletedSettlements.length > 0)
           return deletedSettlements
         }).pipe(Effect.ensuring(reportReplicationView(true)))
       }, Effect.uninterruptible)
@@ -4016,7 +4017,7 @@ export const layer = (
           })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
           yield* updatePendingMetric(result.pendingDelta)
           const entities = result.pendingMutation.changes.map((change) => change.entity)
-          yield* reactivity.withBatch(invalidate(entities, [], true))
+          yield* invalidate(entities, [], true)
           return result.pendingMutation
         })).pipe(Effect.withSpan("LocalStore.ensureQuarantineResubmission", {
           attributes: { "mutation.id": mutationId, "mutation.name": mutation.name }
@@ -4144,22 +4145,25 @@ export const layer = (
             }
             return { applied, created, pending: pendingAfter }
           })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
-          if (committed.created.length > 0) {
-            yield* updatePendingMetric(committed.created.length)
-            const entities = committed.created.flatMap((created) =>
-              created.pendingMutation.changes.map((change) => change.entity)
-            )
-            yield* reactivity.withBatch(invalidate(entities, [], true))
-          }
+          if (committed.created.length > 0) yield* updatePendingMetric(committed.created.length)
+          let scheduled: Exit.Exit<void> = Exit.void
           if (committed.pending !== undefined && options.onMutationsCommitted !== undefined) {
-            yield* options.onMutationsCommitted(committed.pending).pipe(
+            scheduled = yield* options.onMutationsCommitted(committed.pending).pipe(
               Effect.catch((error) =>
                 Effect.logWarning("Committed local mutations could not schedule reconciliation").pipe(
                   Effect.annotateLogs({ error: error._tag, "space.id": options.spaceId })
                 )
-              )
+              ),
+              Effect.exit
             )
           }
+          if (committed.created.length > 0) {
+            const entities = committed.created.flatMap((created) =>
+              created.pendingMutation.changes.map((change) => change.entity)
+            )
+            yield* invalidate(entities, [], true)
+          }
+          yield* scheduled
           return committed.applied
         })).pipe(
           Effect.withSpan("LocalStore.commitMutations", {
@@ -4209,7 +4213,7 @@ export const layer = (
           "client.id": options.clientId
         })
         yield* MutationDescriptor.validate(options.definition, mutation)
-        const result = yield* Deferred.make<
+        const result = Completion.make<
           Protocol.PendingMutation,
           ReplicaError.ReplicaError | Mutation.Rejection<M>
         >()
@@ -4245,18 +4249,18 @@ export const layer = (
                       return Option.some(Cause.squash(cause))
                     }
                   }),
-                  settle: Deferred.done(result, Exit.map(exit, (value) => value.pendingMutation)).pipe(Effect.asVoid)
+                  settle: Completion.settle(result, Exit.map(exit, (value) => value.pendingMutation))
                 }))
               )
             )
           ),
-          fail: (cause) => Deferred.failCause(result, cause).pipe(Effect.asVoid)
+          fail: (cause) => Completion.settle(result, Exit.failCause(cause))
         }
         if (!Queue.offerUnsafe(commitQueue, request)) {
           return yield* new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId })
         }
         admittedCommits += 1
-        return yield* Deferred.await(result).pipe(
+        return yield* Completion.wait(result).pipe(
           Effect.onInterrupt(() =>
             Effect.sync(() => {
               request.withdrawn = true
@@ -4536,7 +4540,7 @@ export const layer = (
         prepareBootstrap,
         stageBootstrapPage,
         installBootstrap,
-        invalidateStatus: reactivity.invalidate([ReactivityKey.status(options.spaceId)])
+        invalidateStatus: notify([ReactivityKey.status(options.spaceId)])
       }
       yield* reportReplicationView(initializedMeta.replication_view_id !== null)
       return Store.of(service)

@@ -8,6 +8,7 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as FiberMap from "effect/FiberMap"
 import * as Layer from "effect/Layer"
@@ -18,6 +19,7 @@ import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as ConnectionLane from "./ConnectionLane.js"
+import * as Completion from "./internal/completion.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
@@ -110,21 +112,21 @@ interface Work {
 const managedKey = (spaceId: Identity.SpaceId, generation: number) => `${spaceId}:${generation}`
 
 const makeReconciliationRequests = (request: Effect.Effect<number, ReplicaError.ReplicaError>) => {
-  let pending: Deferred.Deferred<boolean> | undefined
+  let pending: Completion.Completion<boolean> | undefined
   const run: Effect.Effect<void, ReplicaError.ReplicaError> = Effect.suspend(() => {
     const shared = pending
     if (shared !== undefined) {
-      return Deferred.await(shared).pipe(Effect.flatMap((written) => {
+      return Completion.wait(shared).pipe(Effect.flatMap((written) => {
         if (written) return Effect.void
         return run
       }))
     }
-    const own = Deferred.makeUnsafe<boolean>()
+    const own = Completion.make<boolean>()
     pending = own
     return request.pipe(
       Effect.onExit((exit) => {
         if (exit._tag === "Failure" && pending === own) pending = undefined
-        return Deferred.succeed(own, exit._tag === "Success")
+        return Completion.settle(own, Exit.succeed(exit._tag === "Success"))
       }),
       Effect.asVoid
     )
@@ -616,8 +618,8 @@ export const layerOnePass = (
       const updateAvailable = yield* Ref.make<Identity.SchemaIdentity | undefined>(undefined)
       const setStatus = (value: ReplicaStatus.ReplicaStatus) =>
         Ref.set(status, value).pipe(
-          Effect.andThen(local.invalidateStatus),
-          Effect.andThen(options.onStatusChange?.(value, true) ?? Effect.void)
+          Effect.andThen(options.onStatusChange?.(value, true) ?? Effect.void),
+          Effect.andThen(local.invalidateStatus)
         )
       const reportFailure = (
         error: ReplicaError.ReplicaError,
@@ -649,13 +651,9 @@ export const layerOnePass = (
               Effect.flatMap((next) => {
                 if (next === undefined) return Effect.void
                 failedSinceSyncStarted = true
-                return local.invalidateStatus.pipe(
-                  Effect.andThen(options.onStatusChange?.(next, Option.isSome(counted)) ?? Effect.void),
-                  Effect.catchCause((cause) =>
-                    Errors.logDefect("Failure status notification died", cause).pipe(
-                      Effect.annotateLogs({ "space.id": options.spaceId })
-                    )
-                  )
+                return Effect.andThen(
+                  options.onStatusChange?.(next, Option.isSome(counted)) ?? Effect.void,
+                  local.invalidateStatus
                 )
               })
             )

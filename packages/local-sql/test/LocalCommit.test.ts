@@ -7,6 +7,7 @@ import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -215,11 +216,86 @@ describe("local commit", () => {
       const committed = yield* Effect.forEach(queued, Fiber.join)
 
       const queuedKeys = ids.map((id) => ReactivityKey.entity(spaceId, Domain.Todo.name, id))
-      const rounds = probe.invalidations.filter((keys) => queuedKeys.some((key) => keys.includes(key)))
-      assert.strictEqual(rounds.length, 1)
-      assert.isTrue(queuedKeys.every((key) => rounds[0].includes(key)))
+      const announced = probe.invalidations.flat()
+      const timesAnnounced = (key: string) => announced.filter((candidate) => candidate === key).length
+      assert.deepStrictEqual(queuedKeys.map(timesAnnounced), [1, 1, 1, 1])
+      const pendingRounds = timesAnnounced(ReactivityKey.pending(spaceId))
+      assert.strictEqual(pendingRounds, 2, "the queued mutations shared one round")
       assert.deepStrictEqual(committed.map((pending) => pending.envelope.localSequence), [2, 3, 4, 5])
       assert.strictEqual(yield* local.pendingCount, 5)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "announces a committed mutation whose commit callback died and returns the defect",
+    Effect.fnUntraced(function*() {
+      const base = Context.get(yield* Layer.build(Reactivity.layer), Reactivity.Reactivity)
+      let entity = 0
+      let pending = 0
+      base.registerUnsafe([ReactivityKey.entity(spaceId, Domain.Todo.name, "first")], () => {
+        entity += 1
+      })
+      base.registerUnsafe([ReactivityKey.pending(spaceId)], () => {
+        pending += 1
+      })
+      const { local } = yield* localStore(Layer.succeed(Reactivity.Reactivity, base), () => Effect.die("callback died"))
+
+      const mutated = yield* local.mutate(Domain.PutTodo, Domain.todo("first")).pipe(Effect.exit)
+
+      assert.isTrue(Exit.isFailure(mutated) && Cause.hasDies(mutated.cause), "the caller received the defect")
+      assert.strictEqual(yield* local.pendingCount, 1)
+      assert.deepStrictEqual({ entity, pending }, { entity: 1, pending: 1 })
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "lets the caller of a status notification be interrupted while a subscriber is still running",
+    Effect.fnUntraced(function*() {
+      const probe = yield* makeInvalidationProbe(ReactivityKey.status(spaceId))
+      const { local } = yield* localStore(Layer.succeed(Reactivity.Reactivity, probe.service))
+      const notifying = yield* local.invalidateStatus.pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.await(probe.entered)
+
+      const interrupting = yield* Fiber.interrupt(notifying).pipe(Effect.forkChild({ startImmediately: true }))
+      for (let step = 0; step < 20; step++) yield* Effect.yieldNow
+
+      assert.isTrue(interrupting.pollUnsafe() !== undefined, "the interruption completed while the subscriber ran")
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "delivers the keys an interrupted sync step did not reach",
+    Effect.fnUntraced(function*() {
+      const base = Context.get(yield* Layer.build(Reactivity.layer), Reactivity.Reactivity)
+      const entered = yield* Deferred.make<void>()
+      let holding = false
+      let status = 0
+      base.registerUnsafe([ReactivityKey.status(spaceId)], () => {
+        status += 1
+      })
+      const service = Reactivity.Reactivity.of({
+        ...base,
+        invalidate: (keys) => {
+          if (!holding || !Array.isArray(keys) || !keys.includes(ReactivityKey.pending(spaceId))) {
+            return base.invalidate(keys)
+          }
+          holding = false
+          return Effect.andThen(Deferred.succeed(entered, undefined), Effect.never)
+        }
+      })
+      const { local } = yield* localStore(Layer.succeed(Reactivity.Reactivity, service))
+      yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
+      const statusWhenCommitted = status
+      holding = true
+      const claiming = yield* local.claimSubmitBatch({ after: 0, through: undefined }).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(entered)
+
+      yield* Fiber.interrupt(claiming)
+      for (let step = 0; step < 20; step++) yield* Effect.yieldNow
+
+      assert.strictEqual(status, statusWhenCommitted + 1, "the space status the step did not reach was delivered")
     }, Effect.scoped)
   )
 

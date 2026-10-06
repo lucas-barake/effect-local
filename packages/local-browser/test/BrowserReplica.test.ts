@@ -28,6 +28,7 @@ import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
+import * as Logger from "effect/Logger"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import { AtomRegistry } from "effect/reactivity"
@@ -985,6 +986,71 @@ describe("BrowserReplica", () => {
   )
 
   it.effect(
+    "keeps notifying the subscribers of a follower tab after one of them threw",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        yield* environment.openTab
+        const follower = yield* environment.openTab
+        const space = yield* settle(follower.replica.space(spaceId))
+        yield* settle(space.activate)
+        const reactivity = Context.get(follower.context, Reactivity.Reactivity)
+        let throws = 0
+        let notified = 0
+        reactivity.registerUnsafe([ReactivityKey.pending(spaceId)], () => {
+          throws += 1
+          decodeURIComponent("%")
+        })
+        reactivity.registerUnsafe([ReactivityKey.status(spaceId)], () => {
+          notified += 1
+        })
+
+        yield* settle(space.mutate(PutTodo, { id: "1", title: "first" }))
+        const throwsAfterFirst = throws
+        const notifiedAfterFirst = notified
+        yield* settle(space.mutate(PutTodo, { id: "2", title: "second" }))
+
+        assert.isAbove(throwsAfterFirst, 0, "the subscriber threw while the first mutation was announced")
+        assert.isAbove(notifiedAfterFirst, 0, "the status subscriber was notified of the first mutation")
+        assert.isAbove(throws, throwsAfterFirst, "the second mutation reached the subscriber that throws")
+        assert.isAbove(notified, notifiedAfterFirst, "the status subscriber was notified of the second mutation")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "notifies the subscribers of a follower tab that was opened inside a batch",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        yield* environment.openTab
+        const outer = yield* Reactivity.make
+        const follower = yield* outer.withBatch(environment.openTab)
+        const space = yield* settle(follower.replica.space(spaceId))
+        yield* settle(space.activate)
+        const reactivity = Context.get(follower.context, Reactivity.Reactivity)
+        let pending = 0
+        let status = 0
+        reactivity.registerUnsafe([ReactivityKey.pending(spaceId)], () => {
+          pending += 1
+        })
+        reactivity.registerUnsafe([ReactivityKey.status(spaceId)], () => {
+          status += 1
+        })
+
+        yield* settle(space.mutate(PutTodo, { id: "1", title: "first" }))
+
+        assert.isAbove(pending, 0, "the pending subscriber was notified of the mutation")
+        assert.isAbove(status, 0, "the status subscriber was notified of the mutation")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
     "serves a follower tab's mutations and queries from the leader tab's replica",
     Effect.fnUntraced(
       function*() {
@@ -1242,6 +1308,58 @@ describe("BrowserReplica", () => {
           yield* settle(AtomRegistry.getResult(registry, todos, { suspendOnWaiting: true })),
           [{ id: "3", title: "written on the new leader" }]
         )
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "logs every throw of a follower's subscribers across a handover and keeps notifying them",
+    Effect.fnUntraced(
+      function*() {
+        const logged: Array<string> = []
+        const logger = Logger.make<unknown, void>((entry) => {
+          let message: unknown = entry.message
+          if (Array.isArray(message)) message = message[0]
+          if (entry.logLevel === "Error") logged.push(String(message))
+        })
+        const result = yield* Effect.gen(function*() {
+          const environment = yield* makeEnvironmentWith({ retryDelay: "1 hour" })
+          const leader = yield* environment.openTabWith(true)
+          const next = yield* environment.openTabWith(false)
+          const hidden = yield* testKit.makeMemoryVisibility(false)
+          const graph = ReplicaAtom.make(
+            environment.layerReplicaWith(hidden.service).pipe(Layer.provideMerge(Logger.layer([logger])))
+          )
+          const registry = AtomRegistry.make()
+          yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+          const todos = graph.query(spaceId, ListTodos)(undefined)
+          const unmount = registry.mount(todos)
+          yield* Effect.addFinalizer(() => Effect.sync(unmount))
+          yield* settle(AtomRegistry.getResult(registry, todos, { suspendOnWaiting: true }))
+          const reactivityAtom = graph.runtime.atom(Effect.service(Reactivity.Reactivity))
+          const reactivity = yield* settle(AtomRegistry.getResult(registry, reactivityAtom, { suspendOnWaiting: true }))
+          const throws = { everything: 0, query: 0 }
+          reactivity.registerUnsafe([ReactivityKey.spaces], () => {
+            throws.everything += 1
+            decodeURIComponent("%")
+          })
+          reactivity.registerUnsafe([ReactivityKey.query(spaceId, ListTodos.name, undefined)], () => {
+            throws.query += 1
+            decodeURIComponent("%")
+          })
+          yield* leader.visibility.set(false)
+          yield* next.visibility.set(true)
+          const space = yield* settle(next.replica.space(spaceId))
+          yield* settle(space.mutate(PutTodo, { id: "3", title: "written on the new leader" }))
+          return throws
+        }).pipe(Effect.provide(Logger.layer([logger])))
+
+        const died = logged.filter((message) => message === "Reactivity subscriber died").length
+        assert.isAbove(result.everything, 0, "the subscriber of the space list threw when the follower resubscribed")
+        assert.isAbove(result.query, 0, "the subscriber of the retained query threw")
+        assert.strictEqual(died, result.everything + result.query, "every throw was logged")
       },
       Effect.scoped,
       provideFileSystem
@@ -1804,6 +1922,44 @@ describe("BrowserReplica at small scheduler budgets", () => {
 })
 
 describe("BrowserReplica across builds", () => {
+  it.effect(
+    "logs the throw of a subscriber of an older build's tab when the tab is superseded",
+    Effect.fnUntraced(
+      function*() {
+        const logged: Array<string> = []
+        const logger = Logger.make<unknown, void>((entry) => {
+          let message: unknown = entry.message
+          if (Array.isArray(message)) message = message[0]
+          if (entry.logLevel === "Error") logged.push(String(message))
+        })
+        const result = yield* Effect.gen(function*() {
+          const environment = yield* makeEnvironment
+          yield* environment.openTabWith(true)
+          const follower = yield* environment.openTabWith(false)
+          const reactivity = Context.get(follower.context, Reactivity.Reactivity)
+          const seen = { throws: 0, aggregate: 0 }
+          reactivity.registerUnsafe([ReactivityKey.spaces], () => {
+            seen.throws += 1
+            decodeURIComponent("%")
+          })
+          reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
+            seen.aggregate += 1
+          })
+          const next = yield* environment.openBuild(nextVersionBuild)
+          yield* settle(next.replica.space(spaceId))
+          return seen
+        }).pipe(Effect.provide(Logger.layer([logger])))
+
+        const died = logged.filter((message) => message === "Reactivity subscriber died").length
+        assert.isAbove(result.throws, 0, "the subscriber of the space list threw when the tab was superseded")
+        assert.isAbove(result.aggregate, 0, "the aggregate status subscriber was still notified")
+        assert.strictEqual(died, result.throws, "every throw was logged")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
   it.effect(
     "hands the database to a newer build's tab and fails every older build tab with BuildSuperseded",
     Effect.fnUntraced(

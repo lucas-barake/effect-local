@@ -4,7 +4,6 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
-import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Cause from "effect/Cause"
@@ -37,11 +36,12 @@ import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
 import {
   acceptSubmission,
-  awaitSpaceStatusWhere,
   type Constructor,
   constructors,
   emptyPage,
+  eventually,
   idleRemote,
+  isOnlineDrained,
   makeAttempts,
   viewId
 } from "./fixtures/BackgroundReplica.js"
@@ -87,17 +87,6 @@ const captureLogs = () => {
     })
   return { layerLogs: Logger.layer([logger]), defects, errors, errorMessages }
 }
-
-const eventually = (
-  services: BackgroundReplica.Services,
-  space: Replica.Space,
-  matches: (status: ReplicaStatus.SpaceStatus) => boolean
-) =>
-  awaitSpaceStatusWhere(space, services.reactivity, matches).pipe(
-    Effect.scoped,
-    VirtualTime.advanceUntil,
-    Effect.timeoutOption("5 minutes")
-  )
 
 const isDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Idle" && status.pending === 0
 
@@ -185,8 +174,6 @@ describe("background turns that die", () => {
     }, VirtualTime.scoped)
   )
 })
-
-const isOnlineDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
 
 const foregroundSpaces = Effect.fnUntraced(
   function*(
@@ -1272,7 +1259,7 @@ describe("a runtime close whose pending count failed", () => {
   )
 })
 
-describe("a leave whose notification died after the membership row was deleted", () => {
+describe("a leave whose subscriber threw after the membership row was deleted", () => {
   it.effect.each(constructors)(
     "leaves a space that can be joined, activated and left again with %s",
     Effect.fnUntraced(function*(constructor) {
@@ -1300,7 +1287,7 @@ describe("a leave whose notification died after the membership row was deleted",
       const listed = yield* replica.spaces
       unregister()
 
-      assert.isTrue(Exit.isFailure(left) && Cause.hasDies(left.cause), "the caller received the subscriber defect")
+      assert.isTrue(Exit.isSuccess(left), "the leave completed")
       assert.strictEqual(rows.length, 0, "the membership row was deleted")
       assert.strictEqual(announced, 1, "the change of the space list was announced")
       assert.strictEqual(afterLeave.spaces, 1)
@@ -1913,15 +1900,20 @@ describe("a sync request after a watch failure that fails", () => {
   )
 })
 
-describe("a status subscriber that throws while a failure is reported", () => {
-  it.effect.each(constructors)(
-    "still retries and drains a foreground space with %s",
-    Effect.fnUntraced(function*(constructor) {
+const failureReportSubscribers = constructors.flatMap((constructor) => [
+  { constructor, name: "space status", key: ReactivityKey.status(spaceId) },
+  { constructor, name: "aggregate status", key: ReactivityKey.aggregateStatus }
+])
+
+describe("a subscriber that throws while a failure is reported", () => {
+  it.effect.each(failureReportSubscribers)(
+    "still retries and drains a foreground space when it subscribes to the $name with $constructor",
+    Effect.fnUntraced(function*({ constructor, key }) {
       const services = yield* twoSpaces(constructor)
       const logs = captureLogs()
       let throwing = false
       let unavailable = false
-      services.reactivity.registerUnsafe([ReactivityKey.status(spaceId)], () => {
+      services.reactivity.registerUnsafe([key], () => {
         if (throwing) decodeURIComponent("%")
       })
       const { space } = yield* foregroundSpaces(
@@ -1941,7 +1933,7 @@ describe("a status subscriber that throws while a failure is reported", () => {
       unavailable = true
       yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
       yield* settle("5 seconds")
-      const notified = logs.errorMessages().filter((message) => message === "Failure status notification died")
+      const notified = logs.errorMessages().filter((message) => message === "Reactivity subscriber died")
       throwing = false
       yield* settle("5 minutes")
       const status = yield* space.status
@@ -2106,6 +2098,7 @@ describe("a subscriber that throws while a died background turn is published", (
       })).pipe(Effect.provide(logs.layerLogs))
       const third = yield* replica.space(thirdSpaceId)
       yield* settle("5 minutes")
+      const reported = logs.errorMessages().filter((message) => message === "Reactivity subscriber died")
       const settlements = logs.errorMessages().filter((message) => message === "Background turn settlement died")
       yield* services.sql`UPDATE effect_local_client_spaces
         SET replication_view_id = ${viewId}, replication_view_revision = 0`
@@ -2116,7 +2109,8 @@ describe("a subscriber that throws while a died background turn is published", (
       const drained = yield* eventually(services, third, isDrained)
 
       assert.strictEqual(throws, 2, "the subscriber threw while each died turn was published")
-      assert.strictEqual(settlements.length, 2)
+      assert.strictEqual(reported.length, 2)
+      assert.strictEqual(settlements.length, 0)
       assert.isTrue(Option.isSome(drained), "a worker drained the third space")
     }, VirtualTime.scoped)
   )
@@ -2231,6 +2225,62 @@ const managedSpace = Effect.fnUntraced(function*(readmission: {
     }
   })
   return { waits, synced }
+})
+
+describe("a caller that shares a reconciliation request and whose completion callback throws", () => {
+  it.effect(
+    "does not strand another caller that shared the same request",
+    Effect.fnUntraced(function*() {
+      const release = yield* Deferred.make<void>()
+      const requesting = yield* Deferred.make<void>()
+      let requested = 0
+      const manager = yield* Reconciler.makeManager({ concurrency: 1 }).pipe(
+        Effect.provideService(SyncEngine.SyncEngine, idleRemote)
+      )
+      yield* manager.register({
+        spaceId,
+        generation: 1,
+        definition: Domain.definition,
+        local: {
+          requestReconciliation: Effect.suspend(() => {
+            requested += 1
+            const generation = requested
+            if (generation === 1) return Effect.succeed(generation)
+            return Deferred.succeed(requesting, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.as(generation)
+            )
+          }),
+          reconciliationGenerations: Effect.sync(() => ({ requested, completed: requested })),
+          completeReconciliation: () => Effect.void,
+          replicationState: Effect.never
+        },
+        reconciliation: {
+          sync: Effect.void,
+          generation: Effect.succeed(0),
+          failed: () => Effect.void,
+          watchFailed: () => Effect.void,
+          succeeded: Effect.void,
+          status: Effect.succeed({ _tag: "Connecting", pending: 0 })
+        }
+      })
+      yield* settle("10 millis")
+      const owner = yield* manager.notify(spaceId).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(Deferred.await(requesting))
+      const throwing = yield* manager.notify(spaceId).pipe(Effect.forkChild({ startImmediately: true }))
+      throwing.addObserver(() => {
+        decodeURIComponent("%")
+      })
+      const later = yield* manager.notify(spaceId).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.succeed(release, undefined)
+      yield* settle("10 millis")
+
+      assert.deepStrictEqual(
+        [owner.pollUnsafe() !== undefined, throwing.pollUnsafe() !== undefined, later.pollUnsafe() !== undefined],
+        [true, true, true]
+      )
+    }, VirtualTime.scoped)
+  )
 })
 
 describe("the transport generation a managed readmission reads", () => {

@@ -6,12 +6,12 @@ import * as Fiber from "effect/Fiber"
 import * as Scheduler from "effect/Scheduler"
 import * as TestClock from "effect/testing/TestClock"
 
-interface Driver {
+export interface Driver {
   readonly idle: Effect.Effect<void>
   readonly advanceToNextSleep: Effect.Effect<boolean>
 }
 
-class DeterministicTime extends Context.Service<DeterministicTime, Driver>()(
+export class DeterministicTime extends Context.Service<DeterministicTime, Driver>()(
   "@lucas-barake/effect-local-sql/test/DeterministicTime"
 ) {}
 

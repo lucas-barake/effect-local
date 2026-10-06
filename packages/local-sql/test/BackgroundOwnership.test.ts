@@ -19,7 +19,8 @@ import {
   type Constructor,
   emptyPage,
   idleRemote,
-  makeAttempts
+  makeAttempts,
+  viewId
 } from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
@@ -542,20 +543,57 @@ describe("review 225 suspicions that did not reproduce", () => {
     "interrupts a pending credential wait when the replica shuts down",
     Effect.fnUntraced(function*() {
       const services = yield* pendingBackgroundSpace("layer", singleSpace)
+      const waitStarted = yield* Deferred.make<void>()
       const waitInterrupted = yield* Deferred.make<void>()
       const replicaScope = yield* Scope.make()
       const replica = yield* services.start(SyncEngine.SyncEngine.of({
         ...idleRemote,
         waitForCredentialChange: () =>
-          Effect.onInterrupt(Effect.never, () => Deferred.succeed(waitInterrupted, undefined)),
+          Deferred.succeed(waitStarted, undefined).pipe(
+            Effect.andThen(Effect.never),
+            Effect.onInterrupt(() => Deferred.succeed(waitInterrupted, undefined))
+          ),
         pull: () => Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 7 }))
       })).pipe(Scope.provide(replicaScope))
       const space = yield* replica.space(spaceId)
       yield* awaitSpaceStatus(space, services.reactivity, "NeedsAuthentication")
+      yield* VirtualTime.advanceUntil(Deferred.await(waitStarted))
 
       yield* Scope.close(replicaScope, Exit.void)
 
       assert.isTrue(yield* Deferred.isDone(waitInterrupted))
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(["layer", "layerWorkflow"] as const)(
+    "counts a space that was online as idle when leaving it fails with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* BackgroundReplica.services({
+        ...singleSpace,
+        constructor,
+        clientId,
+        retryDelay: "10 seconds",
+        maximumRetryDelay: "10 seconds"
+      })
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => emptyPage(services.crypto, request)
+      }))
+      yield* services.sql`UPDATE effect_local_client_spaces
+        SET replication_view_id = ${viewId}, replication_view_revision = 0`
+      const space = yield* replica.space(spaceId)
+      yield* space.activate
+      yield* awaitSpaceStatus(space, services.reactivity, "Online").pipe(Effect.scoped, VirtualTime.advanceUntil)
+      services.lockNext("DELETE FROM effect_local_client_spaces")
+
+      const left = yield* Effect.result(replica.leave(spaceId))
+      const status = yield* space.status
+      const aggregate = yield* replica.status
+
+      assert.strictEqual(left._tag, "Failure")
+      assert.strictEqual(status._tag, "Idle")
+      assert.deepStrictEqual({ online: aggregate.counts.online, idle: aggregate.counts.idle }, { online: 0, idle: 1 })
     }, VirtualTime.scoped)
   )
 

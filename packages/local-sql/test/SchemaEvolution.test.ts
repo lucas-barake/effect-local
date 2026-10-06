@@ -11,6 +11,7 @@ import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -28,6 +29,7 @@ import * as Scope from "effect/Scope"
 import * as SqlClient from "effect/sql/SqlClient"
 import type * as SqlError from "effect/sql/SqlError"
 import * as SqlSchema from "effect/sql/SqlSchema"
+import * as Statement from "effect/sql/Statement"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as ConnectionLane from "../src/ConnectionLane.js"
@@ -1871,6 +1873,202 @@ describe("client schema evolution", () => {
               value: { id: 50, title: "intervening", done: false }
             })
           ]))
+      },
+      Effect.scoped,
+      provideDatabase
+    )
+  )
+
+  it.effect(
+    "syncs again after a discard whose aggregate status subscriber throws on every notification",
+    Effect.fnUntraced(
+      function*() {
+        const reactivity = yield* Reactivity.Reactivity
+        let throws = 0
+        const cancel = reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
+          throws += 1
+          decodeURIComponent("%")
+        })
+        yield* Effect.addFinalizer(() => Effect.sync(cancel))
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
+        const original = yield* v1.mutate(PutTodoV1, { id: "71", title: "original" })
+        yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution, { acceptedSchemaVersions: 0 })
+        const live = serverSync(server)
+        const discarded = yield* Deferred.make<void>()
+        const pulledAfterDiscard = yield* Deferred.make<void>()
+        const observed = SyncEngine.SyncEngine.of({
+          ...live,
+          discard: (request) => Effect.tap(live.discard(request), () => Deferred.succeed(discarded, undefined)),
+          pull: (request) =>
+            Deferred.isDone(discarded).pipe(
+              Effect.flatMap((done) => {
+                if (done) return Deferred.succeed(pulledAfterDiscard, undefined)
+                return Effect.void
+              }),
+              Effect.andThen(live.pull(request))
+            )
+        })
+        const replica = yield* buildReplica(definitionV2, layerHandlersV2, observed, evolution)
+
+        const receipt = yield* replica.discardQuarantined(original.envelope.mutationId)
+        const throwsWhenDiscarded = throws
+        yield* Deferred.await(pulledAfterDiscard)
+
+        assert.strictEqual(receipt._tag, "Rejected")
+        assert.isAbove(throwsWhenDiscarded, 0, "the subscriber threw during the discard")
+        assert.deepStrictEqual(yield* replica.quarantine, [])
+      },
+      Effect.scoped,
+      provideDatabase
+    )
+  )
+
+  it.effect.each([
+    { name: "", throws: false, requestDies: false },
+    { name: " and its subscriber throws", throws: true, requestDies: false },
+    { name: " and the request to sync dies", throws: false, requestDies: true }
+  ])(
+    "announces the aggregate status when a resubmission staged its replacement and the server discard failed$name",
+    Effect.fnUntraced(
+      function*(row) {
+        const reactivity = yield* Reactivity.Reactivity
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
+        const original = yield* v1.mutate(PutTodoV1, { id: "73", title: "original" })
+        yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution, { acceptedSchemaVersions: 0 })
+        const live = serverSync(server)
+        let offline = false
+        const remote = SyncEngine.SyncEngine.of({
+          ...live,
+          submitBatch: (request) => {
+            if (offline) return Effect.never
+            return live.submitBatch(request)
+          },
+          pull: (request) => {
+            if (offline) return Effect.never
+            return live.pull(request)
+          },
+          discard: (request) => {
+            if (offline) return Effect.fail(new ReplicaError.ServerUnavailable())
+            return live.discard(request)
+          }
+        })
+        const context = yield* SqlReplica.layer({
+          ...clientHistory,
+          definition: definitionV2,
+          clientId,
+          initialSpaces: [spaceId],
+          schemaEvolutionBatchSize: 1,
+          evolution
+        }).pipe(
+          Layer.provide(layerHandlersV2),
+          Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote)),
+          Layer.build
+        )
+        const replica = Context.get(context, Replica.Replica)
+        const space = yield* replica.space(spaceId)
+        yield* space.activate
+        yield* reactivity.stream([ReactivityKey.status(spaceId)], space.status).pipe(
+          Stream.filter((status) => status._tag === "Online"),
+          Stream.runHead
+        )
+        const before = (yield* replica.status).totalPending
+        let announced = 0
+        const cancel = reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
+          announced += 1
+          if (row.throws) decodeURIComponent("%")
+        })
+        yield* Effect.addFinalizer(() => Effect.sync(cancel))
+        offline = true
+        const replacement = { id: 73, title: "replacement", done: false }
+        const requests: Statement.Transformer = (statement) =>
+          Effect.suspend(() => {
+            const [text] = statement.compile()
+            if (row.requestDies && /SET requested_generation = \?/.test(text)) return Effect.die("request died")
+            return Effect.succeed(statement)
+          })
+
+        const outcome = yield* space.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, replacement).pipe(
+          Effect.provideService(Statement.CurrentTransformer, requests),
+          Effect.exit
+        )
+        const after = (yield* replica.status).totalPending
+
+        assert.isTrue(Exit.isFailure(outcome), "the resubmission failed at the server discard")
+        assert.strictEqual(
+          Exit.isFailure(outcome) && Cause.hasDies(outcome.cause),
+          row.requestDies,
+          "only a request that died ends the resubmission with a defect"
+        )
+        assert.deepStrictEqual({ before, after }, { before: 0, after: 1 })
+        assert.strictEqual(announced, 1, "the aggregate status was announced once")
+      },
+      Effect.scoped,
+      provideDatabase
+    )
+  )
+
+  it.effect(
+    "delivers the status and aggregate changes of a discard inside a batch of the caller before the batch ends",
+    Effect.fnUntraced(
+      function*() {
+        const reactivity = yield* Reactivity.Reactivity
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
+        const original = yield* v1.mutate(PutTodoV1, { id: "74", title: "original" })
+        yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
+        const staged = { id: 74, title: "staged", done: false }
+        yield* buildReplica(definitionV2, layerHandlersV2, unavailableSync, evolution).pipe(
+          Effect.flatMap((staging) =>
+            Effect.flip(staging.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, staged))
+          ),
+          Effect.scoped
+        )
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution, { acceptedSchemaVersions: 0 })
+        const live = serverSync(server)
+        let offline = true
+        const remote = SyncEngine.SyncEngine.of({
+          ...live,
+          submitBatch: (request) => {
+            if (offline) return Effect.fail(new ReplicaError.ServerUnavailable())
+            return live.submitBatch(request)
+          },
+          pull: (request) => {
+            if (offline) return Effect.fail(new ReplicaError.ServerUnavailable())
+            return live.pull(request)
+          }
+        })
+        const replica = yield* buildReplica(definitionV2, layerHandlersV2, remote, evolution)
+        yield* replica.activate
+        yield* reactivity.stream([ReactivityKey.status(spaceId)], replica.status).pipe(
+          Stream.filter((status) => status._tag === "Offline"),
+          Stream.runHead
+        )
+        offline = false
+        const seen = { status: 0, aggregate: 0 }
+        const cancelStatus = reactivity.registerUnsafe([ReactivityKey.status(spaceId)], () => {
+          seen.status += 1
+        })
+        const cancelAggregate = reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
+          seen.aggregate += 1
+        })
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            cancelStatus()
+            cancelAggregate()
+          })
+        )
+
+        const inside = yield* replica.discardQuarantined(original.envelope.mutationId).pipe(
+          Effect.map(() => ({ status: seen.status, aggregate: seen.aggregate })),
+          reactivity.withBatch
+        )
+        const status = yield* replica.status
+
+        assert.strictEqual(status._tag, "Online")
+        assert.isTrue(status.synced, "the discard's sync installed the replication view")
+        assert.isAbove(inside.aggregate, 0, "the aggregate status was announced before the batch ended")
+        assert.deepStrictEqual(inside, seen, "nothing was left for the end of the batch")
       },
       Effect.scoped,
       provideDatabase
