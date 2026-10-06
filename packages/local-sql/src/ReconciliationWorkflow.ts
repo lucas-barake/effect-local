@@ -10,6 +10,7 @@ import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import * as FiberMap from "effect/FiberMap"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
@@ -594,6 +595,9 @@ const layerSchedulerWithConfiguration = (
         return Option.none<ActiveExecution>()
       })
       let retryAttempt = 0
+      let stalledPending = 0
+      let stallTimed = false
+      const stalls = yield* FiberMap.make<"stalled", void, never>()
       let readmit = false
       const superviseTurn = Effect.gen(function*() {
         if (!readmit) yield* LosslessQueue.take(wake)
@@ -634,7 +638,6 @@ const layerSchedulerWithConfiguration = (
                 return Ref.set(activeExecution, Option.none())
               })
             )
-            retryAttempt = 0
           }
         }).pipe(
           Errors.failDiedIteration(
@@ -647,7 +650,21 @@ const layerSchedulerWithConfiguration = (
           ),
           Effect.result
         )
-        if (Result.isSuccess(result)) return false
+        if (Result.isSuccess(result)) {
+          const left = (yield* reconciliation.status).pending
+          if (left === 0 || left < stalledPending) retryAttempt = 0
+          stalledPending = left
+          if (left === 0 || stallTimed) return false
+          retryAttempt += 1
+          stallTimed = true
+          const delay = Configuration.retryMillis(configuration, retryAttempt)
+          const elapsed = Effect.sync(() => {
+            stallTimed = false
+          })
+          const retried = Effect.sleep(delay).pipe(Effect.andThen(elapsed), Effect.andThen(resyncAfterWatchFailure))
+          yield* FiberMap.run(stalls, "stalled", retried)
+          return false
+        }
         const error = result.failure
         if (error._tag === "StaleReplicationScope") {
           readmit = true

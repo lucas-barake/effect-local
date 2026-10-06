@@ -103,6 +103,8 @@ interface ManagedState extends ManagedSpace {
   queued: boolean
   running: boolean
   retryAttempt: number
+  stalledPending: number
+  stallTimed: boolean
   retrying: boolean
   halted: boolean
   authenticationGate: Deferred.Deferred<void> | undefined
@@ -266,6 +268,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
   const turns = yield* FiberMap.make<string, void, never>()
   const watches = yield* FiberMap.make<string, void, never>()
   const retries = yield* FiberMap.make<string, void, never>()
+  const stalls = yield* FiberMap.make<string, void, never>()
   const authenticationWaiters = yield* FiberMap.make<string, void, never>()
   const spaces = new Map<Identity.SpaceId, ManagedState>()
 
@@ -386,6 +389,24 @@ export const makeManager = Effect.fnUntraced(function*(options: {
     )
   })
 
+  const retryUnfinished = Effect.fnUntraced(function*(space: ManagedState) {
+    const left = (yield* space.reconciliation.status).pending
+    if (left === 0 || left < space.stalledPending) space.retryAttempt = 0
+    space.stalledPending = left
+    if (left === 0 || space.stallTimed) return
+    space.retryAttempt += 1
+    space.stallTimed = true
+    const delay = Configuration.retryMillis(space, space.retryAttempt)
+    const elapsed = Effect.sync(() => {
+      space.stallTimed = false
+    })
+    yield* FiberMap.run(
+      stalls,
+      managedKey(space.spaceId, space.generation),
+      Effect.sleep(delay).pipe(Effect.andThen(elapsed), Effect.andThen(readmit(space)))
+    )
+  })
+
   const handleFailure = Effect.fnUntraced(function*(
     space: ManagedState,
     error: ReplicaError.ReplicaError,
@@ -439,7 +460,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       observedGeneration = yield* space.reconciliation.generation
       yield* space.local.completeReconciliation(generations.requested)
       yield* space.reconciliation.succeeded
-      space.retryAttempt = 0
+      yield* retryUnfinished(space)
     })
     const finishTurn = Effect.gen(function*() {
       const current = spaces.get(space.spaceId)
@@ -506,6 +527,8 @@ export const makeManager = Effect.fnUntraced(function*(options: {
         queued: false,
         running: false,
         retryAttempt: 0,
+        stalledPending: 0,
+        stallTimed: false,
         retrying: false,
         halted: false,
         authenticationGate: undefined,
@@ -592,6 +615,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
     yield* FiberMap.remove(watches, key)
     yield* FiberMap.remove(turns, key)
     yield* FiberMap.remove(retries, key)
+    yield* FiberMap.remove(stalls, key)
     yield* FiberMap.remove(authenticationWaiters, key)
   })
 
@@ -1027,6 +1051,9 @@ export const layerInMemoryScheduler = (
         )
       })
       let retryAttempt = 0
+      let stalledPending = 0
+      let stallTimed = false
+      const stalls = yield* FiberMap.make<"stalled", void, never>()
       const retryAfterBackoff = (error: ReplicaError.ReplicaError, transportGeneration: number) =>
         Effect.suspend(() => {
           retryAttempt += 1
@@ -1061,7 +1088,18 @@ export const layerInMemoryScheduler = (
         observedGeneration = yield* reconciliation.generation
         yield* local.completeReconciliation(generations.requested)
         yield* reconciliation.succeeded
-        retryAttempt = 0
+        const left = (yield* reconciliation.status).pending
+        if (left === 0 || left < stalledPending) retryAttempt = 0
+        stalledPending = left
+        if (left === 0 || stallTimed) return
+        retryAttempt += 1
+        stallTimed = true
+        const delay = Configuration.retryMillis(retryTiming, retryAttempt)
+        const elapsed = Effect.sync(() => {
+          stallTimed = false
+        })
+        const retried = Effect.sleep(delay).pipe(Effect.andThen(elapsed), Effect.andThen(resyncAfterWatchFailure))
+        yield* FiberMap.run(stalls, "stalled", retried)
       }).pipe(
         Errors.failDiedIteration(
           "Reconciliation turn died",
