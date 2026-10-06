@@ -68,7 +68,9 @@ application data authority.
    new finite Workflow.
 10. Effect `Reactivity` invalidates affected models, pending inspection, receipts, and status after the SQL transaction
     commits. Every invalidation is delivered one key at a time, after the state it announces is applied and before
-    the operation's waiters resume. A notification is not part of an operation's contract. A subscriber that
+    the operation's waiters resume. The wake-up of activations that wait for a foreground slot is part of that state
+    and is raised before the notification, so a subscriber that never returns cannot keep a slot that was freed or
+    became evictable from the activation waiting for it. A notification is not part of an operation's contract. A subscriber that
     throws, or a custom `Reactivity` that fails or interrupts a notification, is logged at error level with the key,
     and the operation that took effect succeeds. Interrupting the caller's own fiber still interrupts the
     operation. Subscribers registered after a subscriber that throws on the same key miss that one notification,

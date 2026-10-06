@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
+import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -16,6 +17,7 @@ import {
   constructors,
   emptyPage,
   eventually,
+  healthyRemote,
   idleRemote,
   installView,
   isOnlineDrained
@@ -37,6 +39,12 @@ const twoSpaces = (constructor: Constructor) =>
     retryDelay: "1 second",
     maximumRetryDelay: "1 minute"
   })
+
+const activationIsNot = (space: Replica.Space, excluded: Replica.Activation) =>
+  space.activation.pipe(
+    Effect.map((activation) => activation !== excluded),
+    Effect.catch(() => Effect.succeed(false))
+  )
 
 const settle = VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("5 minutes"))
 
@@ -175,6 +183,109 @@ describe("a status subscriber of a published background failure that never retur
 
       assert.isTrue(closing.pollUnsafe() !== undefined, "the close completed")
       yield* Fiber.join(closing)
+    }, VirtualTime.scoped)
+  )
+})
+
+const oneForegroundSlot = (constructor: Constructor) =>
+  BackgroundReplica.services({
+    constructor,
+    clientId,
+    initialSpaces: [spaceId, otherSpaceId],
+    maximumActiveSpaces: 4,
+    foregroundActiveSpaces: 1,
+    retryDelay: "1 second",
+    maximumRetryDelay: "1 minute"
+  })
+
+describe("an activation subscriber of the space that holds the only foreground slot that never returns", () => {
+  it.effect(
+    "does not hold back an activation that waited for the slot when the first activation succeeded",
+    Effect.fnUntraced(function*() {
+      const services = yield* oneForegroundSlot("layer")
+      const replica = yield* services.start(healthyRemote(services))
+      yield* installView(services)
+      const space = yield* replica.space(spaceId)
+      const other = yield* replica.space(otherSpaceId)
+      const building = yield* services.holdStatement("SELECT desired_scope_json", true)
+      const first = yield* space.activate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(building.entered)
+      const waiting = yield* other.activate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      const delivery = yield* services.holdInvalidationWhen(ReactivityKey.activation(spaceId), (fiber) => {
+        if (fiber !== first.id) return Effect.succeed(false)
+        return activationIsNot(space, "Activating")
+      })
+      yield* building.release
+      yield* VirtualTime.advanceUntil(delivery.entered)
+
+      yield* settle
+      const waited = waiting.pollUnsafe()
+      const delivering = first.pollUnsafe() === undefined
+      yield* delivery.release
+
+      assert.isTrue(delivering, "the notification of the first activation was still running")
+      assert.isTrue(waited !== undefined && Exit.isSuccess(waited), "the activation that waited completed")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "does not hold back an activation that waited for the slot when another caller deactivates the first space",
+    Effect.fnUntraced(function*() {
+      const services = yield* oneForegroundSlot("layer")
+      const replica = yield* services.start(healthyRemote(services))
+      yield* installView(services)
+      const space = yield* replica.space(spaceId)
+      const other = yield* replica.space(otherSpaceId)
+      const building = yield* services.holdStatement("SELECT desired_scope_json", true)
+      const first = yield* space.activate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(building.entered)
+      const waiting = yield* other.activate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      const delivery = yield* services.holdInvalidationWhen(ReactivityKey.activation(spaceId), (fiber) => {
+        if (fiber !== first.id) return Effect.succeed(false)
+        return activationIsNot(space, "Activating")
+      })
+      yield* building.release
+      yield* VirtualTime.advanceUntil(delivery.entered)
+
+      const deactivating = yield* space.deactivate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      yield* settle
+      const waited = waiting.pollUnsafe()
+      const deactivated = deactivating.pollUnsafe()
+      const activation = yield* other.activation
+      yield* delivery.release
+
+      assert.isTrue(waited !== undefined && Exit.isSuccess(waited), "the activation that waited completed")
+      assert.isTrue(deactivated !== undefined && Exit.isSuccess(deactivated), "the deactivation completed")
+      assert.strictEqual(activation, "Active")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "does not hold back an activation that waited for the slot when the first activation failed to build with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* oneForegroundSlot(constructor)
+      const replica = yield* services.start(healthyRemote(services))
+      yield* installView(services)
+      const space = yield* replica.space(spaceId)
+      const other = yield* replica.space(otherSpaceId)
+      const building = yield* services.holdStatement("SELECT desired_scope_json")
+      const first = yield* space.activate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(building.entered)
+      const waiting = yield* other.activate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      const delivery = yield* services.holdInvalidationWhen(ReactivityKey.activation(spaceId), (fiber) => {
+        if (fiber !== first.id) return Effect.succeed(false)
+        return activationIsNot(space, "Activating")
+      })
+      yield* building.release
+      yield* VirtualTime.advanceUntil(delivery.entered)
+
+      yield* settle
+      const waited = waiting.pollUnsafe()
+      const delivering = first.pollUnsafe() === undefined
+      yield* delivery.release
+
+      assert.isTrue(delivering, "the notification of the failed activation was still running")
+      assert.isTrue(waited !== undefined && Exit.isSuccess(waited), "the activation that waited completed")
     }, VirtualTime.scoped)
   )
 })

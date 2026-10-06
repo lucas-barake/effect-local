@@ -907,6 +907,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.activation = "Deactivating"
           entry.transition = completion
           dropForegroundReservation(entry)
+          yield* signalCapacity
           yield* invalidateActivation(entry.spaceId)
           const shutdown = Scope.close(runtime.scope, Exit.void)
           const result = yield* runtime.operationGate.withPermits(operationPermits)(shutdown).pipe(Effect.exit)
@@ -1070,9 +1071,9 @@ const makeLayer = <D extends Definition.Any, R,>(
             entry.activation = "Active"
             entry.transition = undefined
             if (foreground) entry.backgroundGeneration += 1
+            yield* signalCapacity
             yield* invalidateActivation(entry.spaceId)
             yield* Completion.settle(completion, Exit.void)
-            yield* signalCapacity
             return result.value
           }
           entry.activation = "Inactive"
@@ -1080,11 +1081,11 @@ const makeLayer = <D extends Definition.Any, R,>(
           dropForegroundReservation(entry)
           const changed = yield* applyContribution(entry, (current) => inactiveStatus(entry, current.pending))
           if (retiring !== undefined) yield* enqueueBackground(entry)
+          yield* signalCapacity
           yield* announceContribution(changed)
           yield* invalidateActivation(entry.spaceId)
           if (Exit.hasInterrupts(result)) yield* Completion.settle(completion, Exit.void)
           else yield* Completion.settle(completion, Exit.asVoid(result))
-          yield* signalCapacity
           return yield* result
         }))
 
