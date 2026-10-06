@@ -1,5 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -22,7 +23,9 @@ import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000f31")
 const otherSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000f32")
+const thirdSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000f33")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000f31")
+const todosOnly = Protocol.ReplicationScope.make({ models: [Domain.Todo.name] })
 
 const twoSpaces = (constructor: Constructor) =>
   BackgroundReplica.services({
@@ -64,6 +67,79 @@ describe("notifications raised inside a batch of the caller", () => {
       assert.strictEqual(insideBatch, 0, "nothing was delivered before the batch ended")
       assert.strictEqual(activation(), 1, "the two activation changes and the caller's own were delivered once")
       assert.strictEqual(yield* space.activation, "Active")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "are delivered once per key when the batch around a mutation that activates the space ends with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(healthyRemote(services))
+      yield* installView(services)
+      const space = yield* replica.space(spaceId)
+      const activation = count(services, ReactivityKey.activation(spaceId))
+
+      const insideBatch = yield* space.mutate(Domain.PutTodo, Domain.todo("first")).pipe(
+        Effect.map(() => activation()),
+        services.reactivity.withBatch
+      )
+
+      assert.strictEqual(insideBatch, 0, "nothing was delivered before the batch ended")
+      assert.strictEqual(activation(), 1, "the two activation changes were delivered once")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "are delivered once per key when the batch around a deactivation ends with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const { space } = yield* onlineSpace(services)
+      const activation = count(services, ReactivityKey.activation(spaceId))
+
+      const insideBatch = yield* space.deactivate.pipe(
+        Effect.map(() => activation()),
+        services.reactivity.withBatch
+      )
+
+      assert.strictEqual(insideBatch, 0, "nothing was delivered before the batch ended")
+      assert.strictEqual(activation(), 1, "the two activation changes were delivered once")
+      assert.strictEqual(yield* space.activation, "Inactive")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "are delivered once per key when the batch around a scope change ends with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const { space } = yield* onlineSpace(services)
+      const scope = count(services, ReactivityKey.scope(spaceId))
+      const activation = count(services, ReactivityKey.activation(spaceId))
+
+      const insideBatch = yield* space.setScope(todosOnly).pipe(
+        Effect.map(() => ({ scope: scope(), activation: activation() })),
+        services.reactivity.withBatch
+      )
+
+      assert.deepStrictEqual(insideBatch, { scope: 0, activation: 0 }, "nothing was delivered before the batch ended")
+      assert.deepStrictEqual({ scope: scope(), activation: activation() }, { scope: 1, activation: 1 })
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "are delivered once per key when the batch around a join ends with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(idleRemote)
+      const membership = count(services, ReactivityKey.membership(thirdSpaceId))
+      const listed = count(services, ReactivityKey.spaces)
+
+      const insideBatch = yield* replica.join(thirdSpaceId).pipe(
+        Effect.map(() => ({ membership: membership(), listed: listed() })),
+        services.reactivity.withBatch
+      )
+
+      assert.deepStrictEqual(insideBatch, { membership: 0, listed: 0 }, "nothing was delivered before the batch ended")
+      assert.deepStrictEqual({ membership: membership(), listed: listed() }, { membership: 1, listed: 1 })
     }, VirtualTime.scoped)
   )
 
