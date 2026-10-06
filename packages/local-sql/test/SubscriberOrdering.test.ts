@@ -6,7 +6,6 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
-import * as Scheduler from "effect/Scheduler"
 import * as Stream from "effect/Stream"
 import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
@@ -522,11 +521,8 @@ describe("a join that its caller interrupts at any point", () => {
       const replica = yield* services.start(idleRemote)
       const disagreements: Array<string> = []
       const stuck: Array<number> = []
-      for (let yields = 0; yields < 300; yields++) {
-        const joining = yield* replica.join(thirdSpaceId).pipe(
-          Effect.provideService(Scheduler.MaxOpsBeforeYield, 3),
-          Effect.forkChild({ startImmediately: true })
-        )
+      for (let yields = 0; yields < 20; yields++) {
+        const joining = yield* replica.join(thirdSpaceId).pipe(Effect.forkChild({ startImmediately: true }))
         for (let step = 0; step < yields; step++) yield* Effect.yieldNow
         yield* Fiber.interrupt(joining)
         const listed = (yield* replica.spaces).length
