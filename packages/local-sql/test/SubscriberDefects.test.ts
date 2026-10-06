@@ -6,6 +6,7 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
+import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -844,6 +845,70 @@ describe("a subscriber that throws on every notification while a foreground take
       assert.strictEqual(describeExit(activated), "failed", "the foreground activation")
       assert.isTrue(Option.isSome(retried), "the background turn of the retired runtime ran again")
       assert.strictEqual(describeStatus(status), "Idle, pending 0")
+    }, VirtualTime.scoped)
+  )
+})
+
+describe("a subscriber of the aggregate status that throws on every notification", () => {
+  it.effect.each(constructors)(
+    "does not fail a foreground takeover that recounts the pending mutations of a background turn with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      yield* BackgroundReplica.seedPending(services, [spaceId])
+      const hanging = yield* Deferred.make<void>()
+      let submitted = false
+      let hung = false
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: (request) => {
+          submitted = true
+          return acceptSubmission(request)
+        },
+        pull: (request) => {
+          if (request.spaceId !== spaceId || !submitted || hung) return emptyPage(services.crypto, request)
+          hung = true
+          return Effect.andThen(Deferred.succeed(hanging, undefined), Effect.never)
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* VirtualTime.advanceUntil(Deferred.await(hanging))
+      let throws = 0
+      services.reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
+        throws += 1
+        decodeURIComponent("%")
+      })
+
+      const activated = yield* within(space.activate)
+      const throwsDuringTakeover = throws
+      yield* settle("5 minutes")
+      const status = yield* space.status
+
+      assert.strictEqual(describeExit(activated), "succeeded", "the foreground activation")
+      assert.isAbove(throwsDuringTakeover, 0, "the subscriber threw during the takeover")
+      assert.strictEqual(describeStatus(status), "Online, pending 0")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "does not turn the failure of a leave into a defect with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const { replica, space } = yield* onlineSpace(services, () => false)
+      let throws = 0
+      services.reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
+        throws += 1
+        decodeURIComponent("%")
+      })
+      services.lockNext("DELETE FROM effect_local_client_spaces")
+
+      const left = yield* within(replica.leave(spaceId))
+      const aggregate = yield* replica.status
+      const status = yield* space.status
+
+      assert.strictEqual(describeExit(left), "failed", "the leave")
+      assert.isAbove(throws, 0, "the subscriber threw")
+      assert.strictEqual(status._tag, "Idle")
+      assert.deepStrictEqual({ online: aggregate.counts.online, idle: aggregate.counts.idle }, { online: 0, idle: 2 })
     }, VirtualTime.scoped)
   )
 })
