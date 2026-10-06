@@ -146,6 +146,39 @@ describe("a status subscriber of a failed background turn that never returns", (
   )
 })
 
+describe("a status subscriber of a published background failure that never returns", () => {
+  it.effect.each(constructors)(
+    "does not hold back the close of the replica with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      yield* BackgroundReplica.seedPending(services, [spaceId])
+      const replicaScope = yield* Scope.make()
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        pull: (request) => emptyPage(services.crypto, request)
+      })).pipe(Scope.provide(replicaScope))
+      const space = yield* replica.space(spaceId)
+      let inactiveAnnouncements = 0
+      const delivery = yield* services.holdInvalidationWhen(ReactivityKey.status(spaceId), () =>
+        space.activation.pipe(
+          Effect.map((activation) => {
+            if (activation === "Inactive") inactiveAnnouncements += 1
+            return inactiveAnnouncements === 2
+          }),
+          Effect.catch(() => Effect.succeed(false))
+        ))
+      yield* VirtualTime.advanceUntil(delivery.entered)
+
+      const closing = yield* Scope.close(replicaScope, Exit.void).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* settle
+
+      assert.isTrue(closing.pollUnsafe() !== undefined, "the close completed")
+      yield* Fiber.join(closing)
+    }, VirtualTime.scoped)
+  )
+})
+
 describe("a membership subscriber of a join that never returns", () => {
   it.effect.each(constructors)(
     "does not hold back the interruption of the join or a join that waited for it with %s",
