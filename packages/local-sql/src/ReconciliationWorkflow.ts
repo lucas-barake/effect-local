@@ -432,7 +432,7 @@ const register = Effect.fnUntraced(function*(
     if (Option.isNone(active)) return
     const tracked = active.value
     const interruptTracked = engine.interruptUnsafe(tracked.workflow, tracked.executionId)
-    const forget = Ref.update(activeExecution, Option.filter((current) => current !== tracked))
+    const forget = Ref.set(activeExecution, Option.none())
     yield* engine.poll(tracked.workflow, tracked.executionId).pipe(
       Effect.onError((cause) => {
         if (Cause.hasInterruptsOnly(cause)) return Effect.void
@@ -610,16 +610,7 @@ const layerSchedulerWithConfiguration = (
         const finished = yield* engine.poll(running.workflow, running.executionId)
         if (Option.isSome(finished)) return Option.none<ActiveExecution>()
         const state = yield* local.replicationState
-        const payload = running.payload
-        if (
-          payload.schemaIdentity === schemaIdentityKey(options.definition) &&
-          payload.spaceId === options.spaceId &&
-          payload.clientId === options.clientId &&
-          payload.membershipIncarnation === local.membershipIncarnation &&
-          payload.scopeGeneration === state.scopeGeneration &&
-          payload.scope.models.length === state.scope.models.length &&
-          payload.scope.models.every((model, index) => model === state.scope.models[index])
-        ) return adopted
+        if (running.payload.scopeGeneration === state.scopeGeneration) return adopted
         yield* engine.interruptUnsafe(running.workflow, running.executionId)
         yield* Ref.set(activeExecution, Option.none())
         return Option.none<ActiveExecution>()
@@ -804,13 +795,7 @@ const layerSchedulerWithConfiguration = (
         )
       })
 
-      const shutdown = Effect.gen(function*() {
-        const supervisorInterruption = yield* Effect.forkChild(Fiber.interrupt(supervisorFiber), {
-          startImmediately: true
-        })
-        yield* registration.cancelExecution
-        yield* Fiber.join(supervisorInterruption)
-      })
+      const shutdown = Fiber.interrupt(supervisorFiber)
       return Reconciler.Reconciler.of({
         sync: reconciliation.sync,
         notify,

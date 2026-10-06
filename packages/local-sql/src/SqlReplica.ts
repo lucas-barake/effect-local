@@ -1437,24 +1437,21 @@ const makeLayer = <D extends Definition.Any, R,>(
         entry: RememberedEntry,
         exit: Exit.Exit<A, E>
       ): Effect.Effect<A, E> =>
-        Effect.suspend(() => {
-          if (entries.get(entry.spaceId) !== entry || entry.leaving) return exit
-          return withActive(entry, (runtime) => recountPending(entry, runtime)).pipe(
-            Effect.catchTag("SpaceUnavailable", () => Effect.void),
-            Effect.catch((error) =>
-              Effect.logError("Pending recount after a quarantine operation failed", error).pipe(
-                Effect.annotateLogs({ "space.id": entry.spaceId })
-              )
-            ),
-            Effect.matchCauseEffect({
-              onSuccess: () => exit,
-              onFailure: (cause): Effect.Effect<A, E> => {
-                if (Exit.isSuccess(exit)) return Effect.failCause(cause)
-                return Effect.failCause(Cause.combine(exit.cause, cause))
-              }
-            })
-          )
-        })
+        withActive(entry, (runtime) => recountPending(entry, runtime)).pipe(
+          Effect.catchTag("SpaceUnavailable", () => Effect.void),
+          Effect.catch((error) =>
+            Effect.logError("Pending recount after a quarantine operation failed", error).pipe(
+              Effect.annotateLogs({ "space.id": entry.spaceId })
+            )
+          ),
+          Effect.matchCauseEffect({
+            onSuccess: () => exit,
+            onFailure: (cause): Effect.Effect<A, E> => {
+              if (Exit.isSuccess(exit)) return Effect.failCause(cause)
+              return Effect.failCause(Cause.combine(exit.cause, cause))
+            }
+          })
+        )
 
       const findReceipt = (runtime: ActiveRuntime, mutationId: Identity.MutationId) =>
         runtime.local.receipt(mutationId).pipe(
@@ -1829,7 +1826,6 @@ const makeLayer = <D extends Definition.Any, R,>(
           current.leaveCompletion = completion
           const cleanup = Effect.suspend(() => current.runtime?.cancelReconciliation ?? Effect.void).pipe(
             Effect.andThen(current.workflowRegistration?.cancelExecution ?? Effect.void),
-            Effect.andThen(signalCapacity),
             Effect.andThen(deactivate(current, true)),
             Effect.andThen(
               lane.withTransaction(
