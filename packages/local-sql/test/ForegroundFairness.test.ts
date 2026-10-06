@@ -280,7 +280,7 @@ describe("operations that compete for one foreground place", () => {
   )
 
   it.effect.each(constructors)(
-    "runs an operation on a space whose background turn is in flight, lets the turn finish, then opens its watch with %s",
+    "runs an operation on a space whose background turn is in flight and leaves the space in the background with %s",
     Effect.fnUntraced(function*(constructor) {
       const services = yield* BackgroundReplica.services({
         constructor,
@@ -331,7 +331,8 @@ describe("operations that compete for one foreground place", () => {
       assert.isFalse(interrupted, "the background turn kept its server call")
       assert.strictEqual(watchesDuringTheTurn, 0)
       assert.isTrue(Option.isSome(drained), "the turn drained the space")
-      assert.isAbove(watches, 0, "the space was made foreground once the turn had finished")
+      assert.strictEqual(watches, 0, "a read that ended before the turn did not make the space foreground")
+      assert.strictEqual(yield* space.activation, "Inactive", "the drained space was closed like any background space")
     }, VirtualTime.scoped)
   )
 })

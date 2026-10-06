@@ -48,12 +48,28 @@ const switching = Effect.fnUntraced(function*(
   let answer: Effect.Effect<void> = Effect.sleep("300 millis")
   if (outage) answer = Deferred.await(reachable)
   let pulls = 0
+  const answeredForFirst: Array<"pull" | "submit" | "interrupted"> = []
+  const logged = <A, E extends { readonly _tag: string },>(
+    spaceId: Identity.SpaceId,
+    call: "pull" | "submit",
+    answered: Effect.Effect<A, E>
+  ) => {
+    if (spaceId !== first) return answered
+    return answered.pipe(
+      Effect.tap(() => Effect.sync(() => answeredForFirst.push(call))),
+      Effect.onInterrupt(() => Effect.sync(() => answeredForFirst.push("interrupted")))
+    )
+  }
   const replica = yield* services.start(SyncEngine.SyncEngine.of({
     ...idleRemote,
-    submitBatch: (request) => Effect.andThen(answer, acceptSubmission(request)),
+    submitBatch: (request) => {
+      const accepted = Effect.andThen(answer, acceptSubmission(request))
+      return logged(request.envelopes[0].spaceId, "submit", accepted)
+    },
     pull: (request) => {
       if (request.spaceId === first) pulls += 1
-      return Effect.andThen(answer, emptyPage(services.crypto, request))
+      const page = Effect.andThen(answer, emptyPage(services.crypto, request))
+      return logged(request.spaceId, "pull", page)
     }
   }))
   yield* installView(services)
@@ -72,18 +88,20 @@ const switching = Effect.fnUntraced(function*(
     VirtualTime.advanceUntil
   )
   const pendingAtStop = (yield* a.status).pending
-  const generations = yield* services.sql<{ readonly completed: number }>`
-    SELECT completed_generation AS completed FROM effect_local_client_spaces WHERE space_id = ${first}`
+  const wholePassesAtStop = answeredForFirst.filter((call, index) =>
+    call === "pull" && answeredForFirst[index + 1] === "submit" && answeredForFirst[index + 2] === "pull"
+  ).length
   const pullsAtStop = pulls
   const executionsAtStop = services.workflowExecutions(first)
   yield* Deferred.succeed(reachable, undefined)
-  const drained = yield* eventually(services, a, (status) => status.pending === 0)
+  const drained = yield* eventually(services, a, (status) =>
+    status.pending === 0)
   yield* quiet
   return {
     visited: describeExit(visited),
     drained: Option.isSome(drained),
     pendingAtStop,
-    completedAtStop: generations[0].completed,
+    wholePassesAtStop,
     executionsAtStop,
     pullsAfter: pulls - pullsAtStop,
     executionsAfter: services.workflowExecutions(first) - executionsAtStop
@@ -109,7 +127,7 @@ describe("a user who keeps moving between two spaces that share one foreground p
 
       assert.strictEqual(result.visited, "succeeded")
       assert.strictEqual(result.pendingAtStop, 0)
-      assert.isAbove(result.completedAtStop, 0, "a pass ended on a pull it had requested itself")
+      assert.isAbove(result.wholePassesAtStop, 0, "a pass ended on a pull it had requested itself")
     }, VirtualTime.scoped),
     120_000
   )

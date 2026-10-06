@@ -164,6 +164,7 @@ interface RememberedEntry {
   transition: Completion.Completion<void, ReplicaError.ReplicaError> | undefined
   foreground: boolean
   foregroundDemand: number
+  callerLeases: number
   promote: boolean
   settlementsRecorded: Completion.Completion<void>
   leases: number
@@ -1097,15 +1098,15 @@ const makeLayer = <D extends Definition.Any, R,>(
           const current = entry.runtime
           if (
             entry.activation === "Active" && current !== undefined &&
-            (!foreground || current.foreground || (leased && entry.leases > 0))
+            (!foreground || current.foreground || (leased && entry.leases > entry.callerLeases))
           ) {
             if (leased && current.pendingRetirements > 0) {
               yield* restore(Completion.wait(capacityChanged))
               continue
             }
             if (leased) entry.leases += 1
+            if (leased && foreground) entry.callerLeases += 1
             if (foreground && current.foreground) touchForegroundResident(entry)
-            if (foreground && !current.foreground) entry.promote = true
             return current
           }
           if (foreground && !foregroundResidents.has(entry.spaceId)) {
@@ -1204,9 +1205,10 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.activation = "Active"
           entry.transition = undefined
           if (leased) entry.leases += 1
+          if (leased && foreground) entry.callerLeases += 1
+          entry.promote = false
           if (foreground) {
             entry.backgroundGeneration += 1
-            entry.promote = false
             entry.serverFailures = 0
             entry.retryNotBefore = 0
           }
@@ -1258,18 +1260,31 @@ const makeLayer = <D extends Definition.Any, R,>(
       const activateForeground = (entry: RememberedEntry) =>
         Effect.uninterruptibleMask((restore) => activate(entry, true, false, restore))
 
-      const release = (entry: RememberedEntry, closesIdleRuntime: boolean) =>
+      const release = (entry: RememberedEntry, holder: "Caller" | "BackgroundTurn" | "WorkflowAttempt") =>
         Effect.suspend(() => {
           entry.leases = Math.max(0, entry.leases - 1)
           const runtime = entry.runtime
-          if (
-            !closesIdleRuntime || entry.leases > 0 || entry.activation !== "Active" || runtime === undefined ||
-            runtime.foreground
-          ) return signalCapacity
+          const background = entry.activation === "Active" && runtime !== undefined && !runtime.foreground
+          if (holder === "Caller") {
+            entry.callerLeases = Math.max(0, entry.callerLeases - 1)
+            if (entry.callerLeases === 0 && entry.leases > 0) entry.promote = false
+          }
+          if (holder !== "Caller" && background && entry.callerLeases > 0) entry.promote = true
+          if (holder === "BackgroundTurn" || entry.leases > 0 || !background || runtime === undefined) {
+            return signalCapacity
+          }
           return signalCapacity.pipe(
             Effect.andThen(Queue.offer(backgroundQueue, { _tag: "Deactivate", entry, runtime })),
             Effect.asVoid
           )
+        })
+
+      const callersReleased = (entry: RememberedEntry, runtime: ActiveRuntime): Effect.Effect<void> =>
+        Effect.suspend(() => {
+          if (entry.runtime !== runtime || entry.activation !== "Active" || entry.callerLeases === 0) {
+            return Effect.void
+          }
+          return Completion.wait(capacityChanged).pipe(Effect.andThen(callersReleased(entry, runtime)))
         })
 
       const endedByRetirement = <A, E extends { readonly _tag: string },>(
@@ -1285,11 +1300,13 @@ const makeLayer = <D extends Definition.Any, R,>(
         foreground: boolean,
         use: (runtime: ActiveRuntime) => Effect.Effect<A, E>
       ): Effect.Effect<A, E | ReplicaError.ReplicaError> =>
-        Effect.uninterruptibleMask((restore) =>
-          activate(entry, foreground, true, restore).pipe(
-            Effect.flatMap((runtime) => restore(use(runtime)).pipe(Effect.ensuring(release(entry, foreground))))
+        Effect.uninterruptibleMask((restore) => {
+          let holder: "Caller" | "BackgroundTurn" = "BackgroundTurn"
+          if (foreground) holder = "Caller"
+          return activate(entry, foreground, true, restore).pipe(
+            Effect.flatMap((runtime) => restore(use(runtime)).pipe(Effect.ensuring(release(entry, holder))))
           )
-        )
+        })
 
       const withActive = <A, E extends { readonly _tag: string },>(
         entry: RememberedEntry,
@@ -1589,6 +1606,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           transition: undefined,
           foreground: false,
           foregroundDemand: 0,
+          callerLeases: 0,
           promote: false,
           settlementsRecorded: Completion.make<void>(),
           leases: 0,
@@ -1614,7 +1632,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         if (workflow !== undefined) {
           const leaseRuntime = Effect.uninterruptibleMask((restore) =>
             activate(entry, false, true, restore).pipe(
-              Effect.tap(() => Effect.addFinalizer(() => release(entry, true)))
+              Effect.tap(() => Effect.addFinalizer(() => release(entry, "WorkflowAttempt")))
             )
           )
           const leasedAttempt = <A,>(
@@ -1829,6 +1847,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         if (work._tag === "Deactivate") {
           let closing: Effect.Effect<unknown, ReplicaError.ReplicaError> = deactivate(entry, false, work.runtime, false)
           if (awaitsPromotion(entry)) closing = promote(entry)
+          entry.promote = false
           const result = yield* Effect.result(closing)
           if (Result.isFailure(result)) {
             yield* settleBackgroundTurn(entry, generation, result.failure, Option.none())
@@ -1856,6 +1875,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         const stalled = Result.isSuccess(result) && Option.isSome(result.success) &&
           entry.summaryStatus.pending > 0 && entry.summaryStatus.pending === pendingBefore
         if (activeRuntime !== undefined) {
+          yield* callersReleased(entry, activeRuntime)
           let closing: Effect.Effect<unknown, ReplicaError.ReplicaError> = deactivate(
             entry,
             false,

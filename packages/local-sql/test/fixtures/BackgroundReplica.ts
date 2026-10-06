@@ -110,6 +110,7 @@ export interface Settings {
   readonly foregroundActiveSpaces: number
   readonly retryDelay: Duration.Input
   readonly maximumRetryDelay: Duration.Input
+  readonly reconciliationConcurrency?: number
 }
 
 const isStatement = (value: unknown): value is Statement.Statement<unknown> =>
@@ -164,7 +165,12 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
   })
   const crypto = Context.get(databaseContext, Crypto.Crypto)
   const reactivity = Context.get(databaseContext, Reactivity.Reactivity)
+  let concurrency: { readonly reconciliationConcurrency?: number } = {}
+  if (settings.reconciliationConcurrency !== undefined) {
+    concurrency = { reconciliationConcurrency: settings.reconciliationConcurrency }
+  }
   const options = {
+    ...concurrency,
     definition: Domain.definition,
     clientId: settings.clientId,
     initialSpaces: settings.initialSpaces,
@@ -192,10 +198,25 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
       readonly release: Deferred.Deferred<void>
     }
     | undefined
+  let heldKeys:
+    | {
+      readonly keys: ReadonlySet<unknown>
+      readonly entered: Set<unknown>
+      readonly release: Deferred.Deferred<void>
+    }
+    | undefined
   const gatedReactivity = new Proxy(reactivity, {
     get: (target, property, receiver) => {
       if (property !== "invalidate") return Reflect.get(target, property, receiver)
       return (keys: Parameters<typeof reactivity.invalidate>[0]) => {
+        const holding = heldKeys
+        if (holding !== undefined && Array.isArray(keys)) {
+          const key: unknown = keys.find((candidate) => holding.keys.has(candidate))
+          if (key !== undefined) {
+            holding.entered.add(key)
+            return target.invalidate(keys).pipe(Effect.andThen(Deferred.await(holding.release)))
+          }
+        }
         const replaced = invalidationOutcome
         if (replaced !== undefined && Array.isArray(keys) && keys.includes(replaced.key)) return replaced.outcome
         const held = heldInvalidation
@@ -275,6 +296,12 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     }
     return { arm, entered: Deferred.await(entered), release: Deferred.succeed(release, undefined) }
   })
+  const holdInvalidationsOf = Effect.fnUntraced(function*(keys: ReadonlyArray<string>) {
+    const release = yield* Deferred.make<void>()
+    const entered = new Set<unknown>()
+    heldKeys = { keys: new Set(keys), entered, release }
+    return { entered: () => entered.size, release: Deferred.succeed(release, undefined) }
+  })
   const holdInvalidationWhen = Effect.fnUntraced(function*(
     key: string,
     matches: (fiberId: number) => Effect.Effect<boolean>
@@ -306,6 +333,7 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     holdStatement,
     holdInvalidation,
     holdInvalidationWhen,
+    holdInvalidationsOf,
     endInvalidationsWith,
     workflowExecutions
   }
