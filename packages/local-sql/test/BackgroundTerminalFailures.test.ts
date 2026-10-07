@@ -234,15 +234,21 @@ const awaitActivation = Effect.fnUntraced(function*(
 
 const protocolInvalid = failures.ProtocolInvalid
 
+const workflowBacksOff = VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 millis"))
+
 const workflowRetryAfterRelease = Effect.fnUntraced(function*(workflowRetry: "fails" | "succeeds") {
   const services = yield* backgroundServices("layerWorkflow")
   const attempts = yield* makeAttempts
+  const backgroundMayStart = yield* Deferred.make<void>()
   const replica = yield* services.start(SyncEngine.SyncEngine.of({
     ...idleRemote,
+    transportGeneration: Effect.as(Deferred.await(backgroundMayStart), 0),
     submitBatch: acceptSubmission,
     pull: (request) => {
       if (attempts.count() === 0) {
-        return Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable()))
+        return Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable())).pipe(
+          Effect.uninterruptible
+        )
       }
       if (attempts.count() === 1 || workflowRetry === "fails") {
         return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
@@ -256,6 +262,8 @@ const workflowRetryAfterRelease = Effect.fnUntraced(function*(workflowRetry: "fa
   yield* space.mutate(Domain.PutTodo, Domain.todo("pending"))
   yield* attempts.reached(1)
   yield* space.deactivate
+  yield* workflowBacksOff
+  yield* Deferred.succeed(backgroundMayStart, undefined)
   yield* attempts.reached(2)
   yield* awaitSpaceStatus(space, services.reactivity, "Failed")
   return { services, attempts, replica, space }
@@ -743,6 +751,7 @@ describe("background sync terminal failures", () => {
       assert.strictEqual(aggregate.totalPending, 0)
 
       yield* space.deactivate
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
       assert.strictEqual((yield* space.status)._tag, "Idle")
       assert.strictEqual((yield* replica.status).counts.idle, 1)
     }, VirtualTime.scoped)
@@ -1056,8 +1065,10 @@ describe("background sync terminal failures", () => {
       const services = yield* backgroundServices("layerWorkflow")
       const attempts = yield* makeAttempts
       const bookkeeping = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
+      const backgroundMayStart = yield* Deferred.make<void>()
       const replica = yield* services.start(SyncEngine.SyncEngine.of({
         ...idleRemote,
+        transportGeneration: Effect.as(Deferred.await(backgroundMayStart), 0),
         submitBatch: acceptSubmission,
         pull: (request) => {
           if (attempts.count() === 0) {
@@ -1074,6 +1085,8 @@ describe("background sync terminal failures", () => {
       yield* space.mutate(Domain.PutTodo, Domain.todo("pending"))
       yield* attempts.reached(1)
       yield* space.deactivate
+      yield* workflowBacksOff
+      yield* Deferred.succeed(backgroundMayStart, undefined)
       yield* bookkeeping.entered
       const drained = awaitAggregate(replica, services.reactivity, (aggregate) => aggregate.totalPending === 0)
       yield* VirtualTime.advanceUntil(Effect.scoped(drained))
@@ -1176,12 +1189,14 @@ describe("background sync terminal failures", () => {
       const services = yield* backgroundServices("layerWorkflow", "1 minute")
       const attempts = yield* makeAttempts
       const release = yield* Deferred.make<void>()
+      const backgroundMayStart = yield* Deferred.make<void>()
       const times: Array<number> = []
       const replica = yield* services.start(SyncEngine.SyncEngine.of({
         ...idleRemote,
+        transportGeneration: Effect.as(Deferred.await(backgroundMayStart), 0),
         pull: () => {
           const unavailable = Effect.fail(new ReplicaError.ServerUnavailable())
-          if (attempts.count() === 0) return Effect.andThen(attempts.record, unavailable)
+          if (attempts.count() === 0) return Effect.uninterruptible(Effect.andThen(attempts.record, unavailable))
           if (attempts.count() === 1) {
             return attempts.record.pipe(Effect.andThen(Deferred.await(release)), Effect.andThen(unavailable))
           }
@@ -1196,6 +1211,8 @@ describe("background sync terminal failures", () => {
       yield* space.mutate(Domain.PutTodo, Domain.todo("pending"))
       yield* attempts.reached(1)
       yield* space.deactivate
+      yield* workflowBacksOff
+      yield* Deferred.succeed(backgroundMayStart, undefined)
       yield* attempts.reached(2)
       yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
       const before = yield* Clock.currentTimeMillis

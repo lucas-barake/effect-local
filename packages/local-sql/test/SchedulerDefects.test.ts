@@ -323,6 +323,7 @@ const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
     ...idleRemote,
     waitForCredentialChange: () => faults.waitForCredentialChange ?? Effect.never,
     waitForTransportChange: () => faults.waitForTransportChange ?? Effect.never,
+    credentialGeneration: Effect.succeed(0),
     transportGeneration: faults.transportGeneration ?? Effect.succeed(0),
     submitBatch: (request) => server.admitBatch(request, null),
     pull: (request) => Effect.andThen(faults.pull, server.pull(request)),
@@ -2220,6 +2221,7 @@ const managedSpace = Effect.fnUntraced(function*(readmission: {
       generation: Effect.succeed(0),
       failed: () => Effect.void,
       watchFailed: () => Effect.void,
+      syncedAfter: () => Effect.never,
       succeeded: Effect.void,
       status: Effect.succeed({ _tag: "Connecting", pending: 0 })
     }
@@ -2260,6 +2262,7 @@ describe("a caller that shares a reconciliation request and whose completion cal
           generation: Effect.succeed(0),
           failed: () => Effect.void,
           watchFailed: () => Effect.void,
+          syncedAfter: () => Effect.never,
           succeeded: Effect.void,
           status: Effect.succeed({ _tag: "Connecting", pending: 0 })
         }

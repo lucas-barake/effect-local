@@ -1,0 +1,406 @@
+import { assert, describe, it } from "@effect/vitest"
+import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Deferred from "effect/Deferred"
+import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
+import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
+import * as SyncEngine from "../src/SyncEngine.js"
+import * as Domain from "./Domain.js"
+import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
+import {
+  acceptSubmission,
+  type Constructor,
+  constructors,
+  describeExit,
+  emptyPage,
+  eventually,
+  idleRemote,
+  installView,
+  makeCapacityProbe,
+  within
+} from "./fixtures/BackgroundReplica.js"
+import * as VirtualTime from "./fixtures/DeterministicTime.js"
+
+const home = Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000f700")
+const others = [
+  Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000f701"),
+  Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000f702"),
+  Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000f703"),
+  Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000f704")
+]
+const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000000f700")
+const backgroundTurnsAtOnce = 1
+const probes = [
+  Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000f711"),
+  Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000f712"),
+  Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000f713")
+]
+
+const quiet = VirtualTime.quiet("1 minute")
+
+const callerKey = (spaceId: Identity.SpaceId) => ReactivityKey.entity(spaceId, Domain.Todo.name, "caller")
+
+const heldBackgroundTurns = Effect.fnUntraced(function*(constructor: Constructor) {
+  const services = yield* BackgroundReplica.services({
+    constructor,
+    clientId,
+    initialSpaces: [home, ...others, ...probes],
+    maximumActiveSpaces: 6,
+    foregroundActiveSpaces: 1,
+    reconciliationConcurrency: backgroundTurnsAtOnce + 1,
+    retryDelay: "10 minutes",
+    maximumRetryDelay: "10 minutes"
+  })
+  yield* BackgroundReplica.seedPending(services, others)
+  const probe = yield* makeCapacityProbe(probes)
+  const turns = yield* Queue.unbounded<Identity.SpaceId>()
+  const answers = new Map<Identity.SpaceId, Deferred.Deferred<void>>()
+  for (const spaceId of others) answers.set(spaceId, yield* Deferred.make<void>())
+  const pulls = new Map<Identity.SpaceId, number>()
+  const replica = yield* services.start(SyncEngine.SyncEngine.of({
+    ...idleRemote,
+    submitBatch: acceptSubmission,
+    pull: (request) => {
+      const page = probe.held(request.spaceId, emptyPage(services.crypto, request))
+      const answer = answers.get(request.spaceId)
+      const count = (pulls.get(request.spaceId) ?? 0) + 1
+      pulls.set(request.spaceId, count)
+      if (answer === undefined || count !== 2) return page
+      return Queue.offer(turns, request.spaceId).pipe(
+        Effect.andThen(Deferred.await(answer)),
+        Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable()))
+      )
+    }
+  }))
+  const current = yield* replica.space(home)
+  yield* VirtualTime.advanceUntil(current.activate)
+  const online = yield* eventually(services, current, (status) => status._tag === "Online")
+  assert.isTrue(Option.isSome(online), "the space the user is on came online")
+  const inFlight = yield* VirtualTime.advanceUntil(Queue.take(turns))
+  const endTurn = (spaceId: Identity.SpaceId) =>
+    Effect.suspend(() => {
+      const answer = answers.get(spaceId)
+      if (answer === undefined) return Effect.void
+      return Deferred.succeed(answer, undefined).pipe(Effect.asVoid)
+    })
+  const capacity = Effect.forEach(others, endTurn, { discard: true }).pipe(
+    Effect.andThen(quiet),
+    Effect.andThen(probe.fill(services, replica, home))
+  )
+  return { services, replica, current, inFlight, endTurn, capacity }
+})
+
+describe("a caller operation on a space whose background turn is in flight", () => {
+  it.effect.each(constructors)(
+    "leaves the space the user returned to in the foreground after a read that ended before the turn with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { capacity, current, endTurn, inFlight, replica } = yield* heldBackgroundTurns(constructor)
+      const passing = yield* replica.space(inFlight)
+
+      const glance = yield* within(passing.get(Domain.Todo, "pending"))
+      const returned = yield* within(current.get(Domain.Todo, "here"))
+      yield* endTurn(inFlight)
+      yield* quiet
+
+      assert.strictEqual(describeExit(glance), "succeeded")
+      assert.strictEqual(describeExit(returned), "succeeded")
+      assert.strictEqual(yield* current.activation, "Active", "the space the user is on kept its place")
+      assert.deepStrictEqual(yield* capacity, {
+        foregroundSynced: true,
+        backgroundCallsAtOnce: backgroundTurnsAtOnce,
+        drained: probes.length
+      })
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "moves the space to the foreground when the operation outlasts the turn with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { capacity, current, endTurn, inFlight, replica, services } = yield* heldBackgroundTurns(constructor)
+      const used = yield* replica.space(inFlight)
+      const delivery = yield* services.holdInvalidationsOf([callerKey(inFlight)])
+      const writing = yield* used.mutate(Domain.PutTodo, Domain.todo("caller")).pipe(
+        Effect.exit,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* VirtualTime.advanceUntil(
+        Effect.suspend(() => {
+          if (delivery.entered() === 1) return Effect.void
+          return Effect.never
+        }).pipe(Effect.timeoutOption("1 minute"))
+      )
+      const heldWhileTurnRan = delivery.entered()
+
+      yield* endTurn(inFlight)
+      yield* quiet
+      const whileHeld = [yield* current.activation, yield* used.activation]
+      yield* delivery.release
+      const written = yield* VirtualTime.advanceUntil(Fiber.join(writing).pipe(Effect.timeoutOption("1 minute")))
+      yield* quiet
+
+      assert.strictEqual(heldWhileTurnRan, 1, "the write ran on the runtime of the background turn")
+      assert.deepStrictEqual(whileHeld, ["Active", "Active"])
+      assert.strictEqual(describeExit(written), "succeeded")
+      assert.deepStrictEqual(
+        [yield* current.activation, yield* used.activation],
+        ["Inactive", "Active"],
+        "the space still in use when its turn ended took the foreground place"
+      )
+      const returned = yield* within(current.get(Domain.Todo, "here"))
+      yield* VirtualTime.quiet("11 minutes")
+      assert.strictEqual(describeExit(returned), "succeeded")
+      assert.strictEqual(yield* current.activation, "Active", "a later background turn did not promote the space again")
+      assert.deepStrictEqual(yield* capacity, {
+        foregroundSynced: true,
+        backgroundCallsAtOnce: backgroundTurnsAtOnce,
+        drained: probes.length
+      })
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "syncs a write made during a turn at once although that turn failed with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { endTurn, inFlight, replica } = yield* heldBackgroundTurns(constructor)
+      const used = yield* replica.space(inFlight)
+
+      const written = yield* used.mutate(Domain.PutTodo, Domain.todo("during")).pipe(within)
+      yield* Effect.forEach(others, endTurn, { discard: true })
+      yield* quiet
+
+      assert.strictEqual(describeExit(written), "succeeded")
+      assert.strictEqual((yield* used.status).pending, 0, "a turn followed without waiting for the retry delay")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "queues an operation that arrives after the turn for a foreground place and forgets the turn with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { current, endTurn, inFlight, replica, services } = yield* heldBackgroundTurns(constructor)
+      const used = yield* replica.space(inFlight)
+      const delivery = yield* services.holdInvalidationsOf([callerKey(inFlight)])
+      const writing = yield* used.mutate(Domain.PutTodo, Domain.todo("caller")).pipe(
+        Effect.exit,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* quiet
+      yield* endTurn(inFlight)
+      yield* quiet
+      const late = yield* used.get(Domain.Todo, "caller").pipe(
+        Effect.exit,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* quiet
+      const lateWhileTheWriteIsHeld = late.pollUnsafe() === undefined
+
+      yield* delivery.release
+      yield* VirtualTime.advanceUntil(Fiber.awaitAll([writing, late]))
+      yield* quiet
+      const whileUsed = [yield* current.activation, yield* used.activation]
+      const returned = yield* within(current.get(Domain.Todo, "here"))
+      yield* VirtualTime.quiet("11 minutes")
+
+      assert.strictEqual(delivery.entered(), 1)
+      assert.isTrue(lateWhileTheWriteIsHeld, "the later read did not join a runtime that only callers still hold")
+      assert.deepStrictEqual(whileUsed, ["Inactive", "Active"])
+      assert.strictEqual(describeExit(returned), "succeeded")
+      assert.strictEqual(yield* current.activation, "Active", "a later background turn did not take the place back")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "keeps the spaces in use by callers at once within the foreground places plus the background turns with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { capacity, endTurn, inFlight, replica, services } = yield* heldBackgroundTurns(constructor)
+      const everySpace = [home, inFlight, ...others.filter((spaceId) => spaceId !== inFlight)]
+      const delivery = yield* services.holdInvalidationsOf(everySpace.map(callerKey))
+      const writes = yield* Effect.forEach(everySpace, (spaceId) =>
+        replica.space(spaceId).pipe(
+          Effect.flatMap((space) => space.mutate(Domain.PutTodo, Domain.todo("caller"))),
+          Effect.exit,
+          Effect.forkChild({ startImmediately: true })
+        ))
+      yield* quiet
+      const inUseWhileTurnRan = delivery.entered()
+
+      yield* endTurn(inFlight)
+      yield* quiet
+      const inUseAfterTurn = delivery.entered()
+      yield* delivery.release
+      for (const spaceId of others) yield* endTurn(spaceId)
+      const written = yield* VirtualTime.advanceUntil(Fiber.joinAll(writes).pipe(Effect.timeoutOption("10 minutes")))
+
+      assert.strictEqual(inUseWhileTurnRan, 1 + backgroundTurnsAtOnce)
+      assert.strictEqual(inUseAfterTurn, 1 + backgroundTurnsAtOnce, "the ended turn did not free a place for a third")
+      assert.isTrue(Option.isSome(written), "every write completed once the held ones were released")
+      assert.deepStrictEqual(yield* capacity, {
+        foregroundSynced: true,
+        backgroundCallsAtOnce: backgroundTurnsAtOnce,
+        drained: probes.length
+      })
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "gives back the foreground place it had reserved when it ran on the background runtime instead with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const used = others[0]
+      const services = yield* BackgroundReplica.services({
+        constructor,
+        clientId,
+        initialSpaces: [home, used, ...probes],
+        maximumActiveSpaces: 3,
+        foregroundActiveSpaces: 1,
+        retryDelay: "10 minutes",
+        maximumRetryDelay: "10 minutes"
+      })
+      yield* BackgroundReplica.seedPending(services, [used])
+      const pulling = yield* Deferred.make<void>()
+      const answered = yield* Deferred.make<void>()
+      const probe = yield* makeCapacityProbe(probes)
+      const building = yield* services.holdStatement("SELECT desired_scope_json", true)
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          const page = probe.held(request.spaceId, emptyPage(services.crypto, request))
+          if (request.spaceId !== used) return page
+          return Deferred.succeed(pulling, undefined).pipe(
+            Effect.andThen(Deferred.await(answered)),
+            Effect.andThen(page)
+          )
+        }
+      }))
+      yield* VirtualTime.advanceUntil(building.entered)
+      const space = yield* replica.space(used)
+      const reading = yield* space.get(Domain.Todo, "pending").pipe(
+        Effect.exit,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* VirtualTime.quiet("1 second")
+      const waitedForTheBuild = reading.pollUnsafe() === undefined
+
+      yield* building.release
+      yield* VirtualTime.advanceUntil(Deferred.await(pulling))
+      const read = yield* VirtualTime.advanceUntil(Fiber.join(reading).pipe(Effect.timeoutOption("1 minute")))
+      yield* Deferred.succeed(answered, undefined)
+      yield* quiet
+      const elsewhere = yield* within((yield* replica.space(home)).get(Domain.Todo, "here"))
+      yield* quiet
+
+      assert.isTrue(waitedForTheBuild, "the read asked for the foreground place while the background runtime was built")
+      assert.strictEqual(describeExit(read), "succeeded")
+      assert.strictEqual(describeExit(elsewhere), "succeeded", "another space could take the foreground place")
+      assert.strictEqual(yield* space.activation, "Inactive", "the background runtime was closed after its turn")
+      assert.deepStrictEqual(yield* probe.fill(services, replica, home), {
+        foregroundSynced: true,
+        backgroundCallsAtOnce: 2,
+        drained: probes.length
+      })
+    }, VirtualTime.scoped)
+  )
+})
+
+const attemptOwned = Effect.fnUntraced(function*() {
+  const used = others[0]
+  const services = yield* BackgroundReplica.services({
+    constructor: "layerWorkflow",
+    clientId,
+    initialSpaces: [home, used],
+    maximumActiveSpaces: 3,
+    foregroundActiveSpaces: 1,
+    retryDelay: "10 minutes",
+    maximumRetryDelay: "10 minutes"
+  })
+  const state = { gate: yield* Deferred.make<void, ReplicaError.ServerUnavailable>(), free: 0, waiting: 0 }
+  const replica = yield* services.start(SyncEngine.SyncEngine.of({
+    ...idleRemote,
+    submitBatch: acceptSubmission,
+    pull: (request) => {
+      const page = emptyPage(services.crypto, request)
+      if (request.spaceId !== used) return page
+      return Effect.suspend(() => {
+        if (state.free > 0) {
+          state.free -= 1
+          return page
+        }
+        state.waiting += 1
+        return Deferred.await(state.gate).pipe(
+          Effect.ensuring(Effect.sync(() => {
+            state.waiting -= 1
+          })),
+          Effect.andThen(page)
+        )
+      })
+    }
+  }))
+  yield* installView(services)
+  const current = yield* replica.space(home)
+  const space = yield* replica.space(used)
+  const answer = Effect.fnUntraced(function*(free: number, outcome: "page" | "unavailable" = "page") {
+    const held = state.gate
+    state.gate = yield* Deferred.make<void, ReplicaError.ServerUnavailable>()
+    state.free = free
+    if (outcome === "page") return yield* Deferred.succeed(held, undefined)
+    return yield* Deferred.fail(held, new ReplicaError.ServerUnavailable())
+  })
+  yield* space.mutate(Domain.PutTodo, Domain.todo("pending")).pipe(VirtualTime.advanceUntil)
+  yield* quiet
+  yield* current.get(Domain.Todo, "here").pipe(VirtualTime.advanceUntil)
+  yield* quiet
+  yield* answer(1)
+  yield* quiet
+  const ownedByTheAttempt = [yield* space.activation, (yield* space.status).pending, state.waiting]
+  const delivery = yield* services.holdInvalidationsOf([callerKey(used)])
+  const writing = yield* space.mutate(Domain.PutTodo, Domain.todo("caller")).pipe(
+    Effect.exit,
+    Effect.forkChild({ startImmediately: true })
+  )
+  yield* quiet
+  assert.deepStrictEqual(ownedByTheAttempt, ["Active", 0, 1], "the worker turn drained the space and the attempt pulls")
+  assert.strictEqual(yield* services.unfinishedWorkflowExecutions(used), 1, "the execution is still at work")
+  assert.strictEqual(delivery.entered(), 1, "the write runs on the runtime the attempt holds")
+  const activations = Effect.all([current.activation, space.activation])
+  return { services, current, space, answer, delivery, writing, activations }
+})
+
+const attemptBudgets = [{ budget: 200 }, { budget: 64 }]
+
+describe("a caller operation on a background runtime held by a workflow attempt alone", () => {
+  it.effect.each(attemptBudgets)(
+    "closes the space once the caller is done when the attempt failed first at a budget of $budget",
+    Effect.fnUntraced(function*(_row) {
+      const { activations, answer, delivery, writing } = yield* attemptOwned()
+
+      yield* answer(1_000, "unavailable")
+      yield* quiet
+      const whileTheCallerHolds = yield* activations
+      yield* delivery.release
+      yield* VirtualTime.advanceUntil(Fiber.await(writing))
+      yield* quiet
+
+      assert.deepStrictEqual(whileTheCallerHolds, ["Active", "Active"], "two spaces serve callers")
+      assert.deepStrictEqual(yield* activations, ["Active", "Inactive"], "nobody was left on an open runtime")
+    }, VirtualTime.atBudget)
+  )
+
+  it.effect.each(attemptBudgets)(
+    "closes the space when the caller leaves before the attempt ends at a budget of $budget",
+    Effect.fnUntraced(function*(_row) {
+      const { activations, answer, delivery, writing } = yield* attemptOwned()
+
+      yield* delivery.release
+      yield* VirtualTime.advanceUntil(Fiber.await(writing))
+      yield* quiet
+      const whileTheAttemptHolds = yield* activations
+      yield* answer(1_000)
+      yield* quiet
+
+      assert.deepStrictEqual(whileTheAttemptHolds, ["Active", "Active"])
+      assert.deepStrictEqual(yield* activations, ["Active", "Inactive"])
+    }, VirtualTime.atBudget)
+  )
+})

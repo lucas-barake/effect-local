@@ -138,6 +138,25 @@ watches from retrying it. `CredentialProvider.awaitChange(rejectedGeneration)` m
 return a different generation. Completion requests a new reconciliation generation, so synchronization resumes on the
 same replica and WebSocket. Rotating a bearer credential does not require rebuilding either Layer.
 
+A reconciliation pass records the generation it starts under. An answer to a pull, a submit or a bootstrap request that
+arrives after the generation changed is discarded, and the pass starts again under the new credential. A credential
+for a different principal must therefore carry a new generation. The replica cannot observe a change of principal that
+keeps the generation, and it would apply that answer. A new generation does not remove what the previous principal
+already replicated. On sign out, leave the spaces of the previous principal or build the replica on another database.
+
+`acquire` must return the same generation until the credential is replaced. The generation is a property of the
+credential, not of the request, so a provider must not derive a new one each time it is asked. The replica reads the
+generation through `acquire` when a pass starts and after every answer, and a provider that changes it on each read
+makes every answer look stale. The first change during a pass restarts the pass at once. A second change during that
+restart fails the pass with `UnexpectedFailure`, which is retried with the normal backoff, so a generation that never
+settles costs two server calls per retry delay and the space reports `Failed` until it does.
+
+The same comparison guards the discard of a quarantined mutation. Its answer is dropped when the generation changed
+while the call was in flight, and the call is sent once more. A watch keeps the credential it was opened with, so
+`SyncClient` ends the watch stream when `awaitChange` completes for the generation that `acquire` returned when the
+watch started. The replica handles that like any watch the server closed: it waits the closed watch delay and opens the
+watch again under the new credential.
+
 Authentication and authorization failures remain distinct:
 
 | Failure                    | Meaning                                                         | Reconciliation status and policy                 |

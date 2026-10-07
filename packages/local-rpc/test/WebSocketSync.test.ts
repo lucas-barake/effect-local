@@ -443,6 +443,13 @@ const awaitStatus = (
     Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
   )
 
+const watchUnderRefreshedCredential = <A extends { readonly rpc: string; readonly authorization: string | undefined },>(
+  attempts: Queue.Dequeue<A>
+) =>
+  LosslessQueue.take(attempts).pipe(
+    Effect.repeat({ until: (attempt) => attempt.rpc === "Watch" && attempt.authorization === "Bearer refreshed" })
+  )
+
 const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
   readonly rpcTimeout?: Duration.Input
   readonly sessionAcquisitionTimeout?: Duration.Input
@@ -455,7 +462,10 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
   const attempts = yield* Queue.unbounded<{
     readonly mode: AuthenticatorMode
     readonly rpc: string
+    readonly authorization: string | undefined
   }>()
+  const rotateAfterAcquisition = MutableRef.make<number | undefined>(undefined)
+  let acquisitionsSinceArmed = 0
   const applications = yield* Queue.unbounded<string>()
   const watchStarted = yield* Deferred.make<void>()
   const pullEntered = yield* Deferred.make<void>()
@@ -466,8 +476,15 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
   const lifecycleWebSocketConstructions = MutableRef.make(0)
 
   const credentialProvider = Authentication.makeCredentialProvider(credentials)
+  const rotateWhenDue = Effect.suspend(() => {
+    const due = MutableRef.get(rotateAfterAcquisition)
+    if (due === undefined) return Effect.void
+    acquisitionsSinceArmed += 1
+    if (acquisitionsSinceArmed !== due) return Effect.void
+    return SubscriptionRef.set(credentials, { generation: 1, bearer: Redacted.make("refreshed") })
+  })
   const provider = Authentication.CredentialProvider.of({
-    acquire: credentialProvider.acquire,
+    acquire: Effect.tap(credentialProvider.acquire, () => rotateWhenDue),
     awaitChange: (generation) =>
       Deferred.succeed(refreshWaitStarted, generation).pipe(
         Effect.andThen(credentialProvider.awaitChange(generation))
@@ -495,7 +512,8 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
     return Authentication.Authentication.of((effect, request) =>
       Queue.offer(attempts, {
         mode: MutableRef.get(mode),
-        rpc: request.rpc._tag
+        rpc: request.rpc._tag,
+        authorization: request.headers.authorization
       }).pipe(
         Effect.andThen(Effect.suspend(() => {
           if (request.rpc._tag === "Watch") return Deferred.succeed(watchStarted, undefined)
@@ -607,6 +625,7 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
     pullRelease,
     replicaLayer,
     refreshWaitStarted,
+    rotateAfterAcquisition,
     watchStarted
   }
 })
@@ -678,6 +697,69 @@ describe("WebSocket synchronization", () => {
       assert.strictEqual(Context.get(replicaContext, Replica.Replica), replica)
       assert.strictEqual(MutableRef.get(harness.webSocketConstructions), 1)
     })
+  )
+
+  it.effect(
+    "opens the watch again under a credential the application replaced while the space was idle",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeLifecycleHarness()
+      const recording = yield* RecordingClock.make
+      const layerRecordingClock = Layer.succeed(Clock.Clock, recording.clock)
+      const replicaContext = yield* Layer.build(harness.replicaLayer("4 seconds", layerRecordingClock))
+      const replica = Context.get(replicaContext, Replica.Replica)
+      const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
+      const space = yield* replica.space(spaceId)
+      yield* Effect.provideService(space.activate, Clock.Clock, recording.clock)
+      yield* Effect.all([
+        awaitStatus(reactivity, space, "Online"),
+        Deferred.await(harness.watchStarted)
+      ], { discard: true, concurrency: "unbounded" })
+
+      yield* SubscriptionRef.set(harness.credentials, {
+        generation: 1,
+        bearer: Redacted.make("refreshed")
+      })
+      const closedWatchDelays = recording.nextSleep((request) => request.millis === 1_000).pipe(
+        Effect.flatMap((delay) => recording.advanceTo(delay.deadline)),
+        Effect.forever
+      )
+      const reopened = yield* Effect.raceFirst(watchUnderRefreshedCredential(harness.attempts), closedWatchDelays)
+
+      assert.strictEqual(reopened.authorization, "Bearer refreshed")
+      assert.strictEqual((yield* awaitStatus(reactivity, space, "Online"))._tag, "Online")
+      assert.strictEqual(MutableRef.get(harness.webSocketConstructions), 1)
+    })
+  )
+
+  it.effect.each([1, 2])(
+    "does not leave a watch open under a credential replaced after acquisition %s of the watch",
+    Effect.fnUntraced(
+      function*(acquisition) {
+        const harness = yield* makeLifecycleHarness()
+        const context = yield* Layer.build(harness.layerLive)
+        const remote = Context.get(context, SyncEngine.SyncEngine)
+        const watch = remote.watch({
+          spaceId,
+          clientId,
+          schema: definition.schemaIdentity,
+          scope,
+          scopeGeneration,
+          cursor: null
+        })
+        yield* watch.pipe(Stream.take(1), Stream.runDrain)
+        MutableRef.set(harness.rotateAfterAcquisition, acquisition)
+
+        const watching = yield* watch.pipe(Stream.runDrain, Effect.forkChild({ startImmediately: true }))
+        const ended = Fiber.join(watching).pipe(Effect.as("ended to be opened again"))
+        const authenticated = watchUnderRefreshedCredential(harness.attempts).pipe(
+          Effect.as("authenticated with the new credential")
+        )
+        const outcome = yield* Effect.raceFirst(ended, authenticated)
+
+        assert.include(["ended to be opened again", "authenticated with the new credential"], outcome)
+      },
+      provideNodeCrypto
+    )
   )
 
   it.effect(

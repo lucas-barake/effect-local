@@ -510,6 +510,7 @@ const buildReplica = <D extends Definition.Any,>(
 
 const unavailableSync = SyncEngine.SyncEngine.of({
   waitForCredentialChange: () => Effect.never,
+  credentialGeneration: Effect.succeed(0),
   transportGeneration: Effect.succeed(0),
   waitForTransportChange: () => Effect.never,
   submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
@@ -522,6 +523,7 @@ const unavailableSync = SyncEngine.SyncEngine.of({
 const serverSync = (server: ServerStore.Service) =>
   SyncEngine.SyncEngine.of({
     waitForCredentialChange: () => Effect.never,
+    credentialGeneration: Effect.succeed(0),
     transportGeneration: Effect.succeed(0),
     waitForTransportChange: () => Effect.never,
     submitBatch: (request) => server.admitBatch(request, null),
@@ -2000,6 +2002,10 @@ describe("client schema evolution", () => {
           Exit.isFailure(outcome) && Cause.hasDies(outcome.cause),
           row.requestDies,
           "only a request that died ends the resubmission with a defect"
+        )
+        assert.isTrue(
+          Exit.isFailure(outcome) && Cause.hasFails(outcome.cause),
+          "the failure of the server discard is kept next to a defect of the recount"
         )
         assert.deepStrictEqual({ before, after }, { before: 0, after: 1 })
         assert.strictEqual(announced, 1, "the aggregate status was announced once")
