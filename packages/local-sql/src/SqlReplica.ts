@@ -1875,7 +1875,7 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const freeForPromotion = (entry: RememberedEntry) =>
         entries.get(entry.spaceId) === entry && !entry.leaving && entry.activation === "Active" &&
-        entry.runtime !== undefined && !entry.runtime.foreground && entry.leases === 0
+        entry.runtime !== undefined && !entry.runtime.foreground
 
       const runBackgroundWork = Effect.fnUntraced(function*(
         work: BackgroundWork,
