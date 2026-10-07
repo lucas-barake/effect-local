@@ -342,9 +342,8 @@ const makeLayer = <D extends Definition.Any, R,>(
         options.maximumActiveSpaces - options.foregroundActiveSpaces,
         reconciliationConcurrency - foregroundReconciliationConcurrency
       )
-      const backgroundActiveSpaces = yield* Semaphore.make(
-        options.maximumActiveSpaces - options.foregroundActiveSpaces
-      )
+      const backgroundRuntimeLimit = options.maximumActiveSpaces - options.foregroundActiveSpaces
+      let backgroundRuntimes = 0
       const foregroundWorkflowTurns = yield* Semaphore.make(foregroundReconciliationConcurrency)
       const backgroundWorkflowTurns = yield* Semaphore.make(
         reconciliationConcurrency - foregroundReconciliationConcurrency
@@ -566,13 +565,6 @@ const makeLayer = <D extends Definition.Any, R,>(
         childScope: Scope.Closeable
       ) {
         const spaceId = entry.spaceId
-        if (!foreground) {
-          yield* Effect.acquireRelease(
-            backgroundActiveSpaces.take(1),
-            () => backgroundActiveSpaces.release(1),
-            { interruptible: true }
-          ).pipe(Scope.provide(childScope))
-        }
         const replicationScope = yield* durableScope(spaceId)
         const layerMutationRuntime = MutationRuntime.layer(options.definition, options.evolution)
         const reconcilerReady = yield* Deferred.make<Reconciler.Service>()
@@ -720,20 +712,28 @@ const makeLayer = <D extends Definition.Any, R,>(
         } satisfies ActiveRuntime
       })
 
+      const releaseBackgroundSlot = Effect.suspend(() => {
+        backgroundRuntimes -= 1
+        return signalCapacity
+      })
+
       const initialize = (
         entry: RememberedEntry,
         generation: number,
-        foreground: boolean
+        foreground: boolean,
+        restore: Restore
       ): Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError> =>
-        Effect.uninterruptibleMask((restore) =>
-          Scope.fork(parentScope).pipe(
-            Effect.flatMap((childScope) =>
-              restore(buildRuntime(entry, generation, foreground, childScope)).pipe(
-                Effect.onExit((exit) => {
-                  if (Exit.isFailure(exit)) return Scope.close(childScope, exit)
-                  return Effect.void
-                })
-              )
+        Scope.fork(parentScope).pipe(
+          Effect.tap((childScope) => {
+            if (foreground) return Effect.void
+            return Scope.addFinalizer(childScope, releaseBackgroundSlot)
+          }),
+          Effect.flatMap((childScope) =>
+            restore(buildRuntime(entry, generation, foreground, childScope)).pipe(
+              Effect.onExit((exit) => {
+                if (Exit.isFailure(exit)) return Scope.close(childScope, exit)
+                return Effect.void
+              })
             )
           )
         )
@@ -1176,8 +1176,13 @@ const makeLayer = <D extends Definition.Any, R,>(
             yield* restore(Completion.wait(capacityChanged))
             continue
           }
+          if (!foreground && backgroundRuntimes === backgroundRuntimeLimit) {
+            yield* restore(Completion.wait(capacityChanged))
+            continue
+          }
           break
         }
+        if (!foreground) backgroundRuntimes += 1
         const completion = Completion.make<void, ReplicaError.ReplicaError>()
         const generation = ++nextGeneration
         entry.activation = "Activating"
@@ -1185,7 +1190,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         entry.runtime = undefined
         yield* modifyContribution(entry, (current) => ({ _tag: "Connecting", pending: current.pending }))
         yield* invalidateActivation(entry.spaceId)
-        const startRuntime = restore(initialize(entry, generation, foreground))
+        const startRuntime = initialize(entry, generation, foreground, restore)
         let start = startRuntime
         if (replaced !== undefined) {
           start = replaced.operationGate.withPermits(operationPermits)(Scope.close(replaced.scope, Exit.void)).pipe(
