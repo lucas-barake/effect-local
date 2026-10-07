@@ -318,12 +318,9 @@ const handler = (
           )
         }).pipe(Effect.result)
         if (Result.isSuccess(result)) return
-        if (result.failure._tag === "StaleReplicationScope") {
-          yield* result.failure
-          return
-        }
         yield* Effect.scoped(Effect.gen(function*() {
           const runtime = yield* lease.acquire
+          yield* validateScope(runtime.local)
           const generation = observedGeneration ?? (yield* runtime.reconciliation.generation)
           yield* runtime.reconciliation.failed(result.failure, generation)
         }))
@@ -614,7 +611,6 @@ const layerSchedulerWithConfiguration = (
         }
         const state = yield* local.replicationState
         if (running.payload.scopeGeneration === state.scopeGeneration) return adopted
-        yield* engine.interruptUnsafe(running.workflow, running.executionId)
         yield* Ref.set(activeExecution, Option.none())
         return Option.none<ActiveExecution>()
       })
@@ -681,10 +677,6 @@ const layerSchedulerWithConfiguration = (
         }
         const error = result.failure
         yield* position.cancelStalledRetry
-        if (error._tag === "StaleReplicationScope") {
-          readmit = true
-          return false
-        }
         if (error._tag === "CredentialRejected") {
           if (error.credentialGeneration === undefined) {
             yield* reconciliation.failed(error, observedGeneration)
