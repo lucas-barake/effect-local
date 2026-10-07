@@ -9,6 +9,7 @@ import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -352,6 +353,106 @@ describe("a quarantine operation whose space is left while the server call is in
       assert.strictEqual(describeExit(left), "succeeded")
       assert.strictEqual(outcome, expected[row.answer])
       assert.deepStrictEqual(logs.messages(), [], "a recount that found the space gone is not an error")
+    }, harness)
+  )
+})
+
+const cancellationThatSyncs = Effect.fnUntraced(function*(constructor: Row["constructor"]) {
+  const v1 = yield* buildStore(definitionV1, layerHandlersV1)
+  const original = yield* v1.mutate(PutTodoV1, { id: "71", title: "original" })
+  yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
+  const writable = yield* buildStore(definitionV2, layerHandlersV2, evolution)
+  yield* writable.mutate(PutTodoV2, { id: 72, title: "intervening", done: false })
+  const server = yield* buildServer(definitionV2, layerHandlersV2, evolution, { acceptedSchemaVersions: 0 })
+  const submits: Array<number> = []
+  const entered = yield* Deferred.make<void>()
+  let mode: "unavailable" | "held" | "answered" = "unavailable"
+  let discardable = false
+  const remote = SyncEngine.SyncEngine.of({
+    waitForCredentialChange: () => Effect.never,
+    credentialGeneration: Effect.succeed(0),
+    transportGeneration: Effect.succeed(0),
+    waitForTransportChange: () => Effect.never,
+    submitBatch: (request) =>
+      Clock.currentTimeMillis.pipe(
+        Effect.flatMap((now) => {
+          submits.push(now)
+          if (mode === "unavailable") return Effect.fail(new ReplicaError.ServerUnavailable())
+          if (mode === "held") return Effect.andThen(Deferred.succeed(entered, undefined), Effect.never)
+          return server.admitBatch(request, null)
+        })
+      ),
+    discard: (request) => {
+      if (!discardable) return Effect.fail(new ReplicaError.ServerUnavailable())
+      return server.discard(request, null)
+    },
+    pull: server.pull,
+    bootstrap: server.bootstrap,
+    watch: server.watch
+  })
+  const options: SqlReplica.Options<typeof definitionV2> = {
+    ...clientHistory,
+    definition: definitionV2,
+    clientId,
+    initialSpaces: [spaceId, otherSpaceId],
+    maximumActiveSpaces: 3,
+    foregroundActiveSpaces: 1,
+    schemaEvolutionBatchSize: 1,
+    retryDelay: "1 second",
+    maximumRetryDelay: "1 minute",
+    evolution
+  }
+  const layerServices = Layer.merge(layerHandlersV2, Layer.succeed(SyncEngine.SyncEngine, remote))
+  let layerReplica = SqlReplica.layer(options).pipe(Layer.provide(layerServices))
+  if (constructor === "layerWorkflow") {
+    layerReplica = SqlReplica.layerWorkflow(options).pipe(
+      Layer.provide(layerServices),
+      Layer.provide(WorkflowEngine.layerMemory)
+    )
+  }
+  const replica = Context.get(yield* Layer.build(layerReplica), Replica.Replica)
+  const space = yield* replica.space(spaceId)
+  const mutationId = original.envelope.mutationId
+  const staged = yield* space.resubmitQuarantined(mutationId, PutTodoV2, { id: 71, title: "staged", done: false }).pipe(
+    Effect.result,
+    VirtualTime.advanceUntil
+  )
+  discardable = true
+  return {
+    space,
+    submits,
+    staged,
+    entered: Deferred.await(entered),
+    discard: space.discardQuarantined(mutationId),
+    setMode: (next: "unavailable" | "held" | "answered") => {
+      mode = next
+    }
+  }
+})
+
+describe("the cancellation of a staged replacement that syncs before it discards", () => {
+  it.effect.each(constructors)(
+    "is ended by a deactivation of its space and syncs again after the retry delay with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { discard, entered, setMode, space, staged, submits } = yield* cancellationThatSyncs(constructor)
+      const failed = yield* discard.pipe(Effect.result, VirtualTime.advanceUntil)
+      const failedAt = submits.at(-1) ?? 0
+      setMode("held")
+      const waiting = yield* discard.pipe(Effect.result, Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(entered)
+
+      setMode("answered")
+      const deactivated = yield* within(space.deactivate)
+      yield* VirtualTime.quiet("900 millis")
+      const waitingWithinTheDelay = waiting.pollUnsafe() === undefined
+      const finished = yield* Fiber.join(waiting).pipe(within)
+      const finishedAt = yield* Clock.currentTimeMillis
+
+      assert.deepStrictEqual([Result.isFailure(staged), Result.isFailure(failed)], [true, true])
+      assert.strictEqual(describeExit(deactivated), "succeeded", "the sync of the cancellation gave up its use")
+      assert.isTrue(waitingWithinTheDelay, "the cancellation did not sync again before the retry time")
+      assert.strictEqual(outcomeOf(finished), "succeeded")
+      assert.isAtLeast(finishedAt - failedAt, 1_000)
     }, harness)
   )
 })

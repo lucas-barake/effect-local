@@ -162,6 +162,21 @@ describe("a caller operation on a space whose background turn is in flight", () 
   )
 
   it.effect.each(constructors)(
+    "syncs a write made during a turn at once although that turn failed with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { endTurn, inFlight, replica } = yield* heldBackgroundTurns(constructor)
+      const used = yield* replica.space(inFlight)
+
+      const written = yield* used.mutate(Domain.PutTodo, Domain.todo("during")).pipe(within)
+      yield* Effect.forEach(others, endTurn, { discard: true })
+      yield* quiet
+
+      assert.strictEqual(describeExit(written), "succeeded")
+      assert.strictEqual((yield* used.status).pending, 0, "a turn followed without waiting for the retry delay")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
     "queues an operation that arrives after the turn for a foreground place and forgets the turn with %s",
     Effect.fnUntraced(function*(constructor) {
       const { current, endTurn, inFlight, replica, services } = yield* heldBackgroundTurns(constructor)

@@ -369,6 +369,31 @@ describe("a workflow that sleeps before it retries a failed sync", () => {
   )
 
   it.effect(
+    "is replaced at once when the scope of its space changes and ends without a server call",
+    Effect.fnUntraced(function*() {
+      const { pulls, services, space } = yield* asleepAfterAFailure("answered")
+      yield* VirtualTime.advanceUntil(space.activate)
+      yield* VirtualTime.quiet("1 second")
+      const wide = Protocol.ReplicationScope.make({ models: [Domain.Todo.name, Domain.Message.name] })
+
+      const changed = yield* within(space.setScope(wide))
+      yield* VirtualTime.quiet("1 second")
+      const afterTheChange = [pulls(), (yield* space.status)._tag]
+      yield* VirtualTime.quiet("11 minutes")
+
+      assert.strictEqual(describeExit(changed), "succeeded")
+      assert.deepStrictEqual(
+        afterTheChange,
+        [3, "Online"],
+        "the new scope was pulled without waiting for the old retry"
+      )
+      assert.strictEqual(pulls(), 3, "the execution of the old scope ended without a server call")
+      assert.strictEqual(yield* services.unfinishedWorkflowExecutions(parked), 0)
+      assert.strictEqual((yield* space.status)._tag, "Online")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
     "is neither doubled nor forgotten while the engine cannot say whether it still runs",
     Effect.fnUntraced(function*() {
       const { services, space } = yield* asleepAfterAFailure("answered")

@@ -1,21 +1,27 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Clock from "effect/Clock"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
 import * as Scope from "effect/Scope"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
 import {
+  acceptSubmission,
   type Constructor,
   constructors,
+  describeExit,
   emptyPage,
   eventually,
   idleRemote,
-  installView
+  installView,
+  within
 } from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
@@ -282,6 +288,144 @@ describe("the retry of a foreground sync that left accepted work pending", () =>
       yield* VirtualTime.quiet("3 seconds")
 
       assert.deepStrictEqual(pulledAt(), [0, 500, 1000, 3000])
+    }, VirtualTime.scoped)
+  )
+})
+
+const failingServer = Effect.fnUntraced(function*(constructor: Constructor, seeded: boolean) {
+  const services = yield* BackgroundReplica.services({
+    constructor,
+    clientId,
+    initialSpaces: [spaceId],
+    maximumActiveSpaces: 4,
+    foregroundActiveSpaces: 2,
+    retryDelay: "1 second",
+    maximumRetryDelay: "1 minute"
+  })
+  if (seeded) yield* BackgroundReplica.seedPending(services, [spaceId])
+  const server = { failures: 0 }
+  const pulls: Array<number> = []
+  const replica = yield* services.start(SyncEngine.SyncEngine.of({
+    ...idleRemote,
+    submitBatch: acceptSubmission,
+    pull: (request) => {
+      const answered = Effect.suspend((): Effect.Effect<void, ReplicaError.ServerUnavailable> => {
+        if (server.failures === 0) return Effect.void
+        server.failures -= 1
+        return Effect.fail(new ReplicaError.ServerUnavailable())
+      })
+      return Clock.currentTimeMillis.pipe(
+        Effect.tap((now) => Effect.sync(() => pulls.push(now))),
+        Effect.andThen(answered),
+        Effect.andThen(emptyPage(services.crypto, request))
+      )
+    }
+  }))
+  if (!seeded) yield* installView(services)
+  const space = yield* replica.space(spaceId)
+  return { services, replica, server, pulls, space }
+})
+
+describe("the retry position a space keeps for its server calls", () => {
+  it.effect.each(constructors)(
+    "starts over after a sync succeeded with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { pulls, server, space } = yield* failingServer(constructor, false)
+      server.failures = 3
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first")).pipe(VirtualTime.advanceUntil)
+      yield* VirtualTime.quiet("10 seconds")
+      const before = pulls.length
+
+      server.failures = 1
+      yield* space.mutate(Domain.PutTodo, Domain.todo("second")).pipe(VirtualTime.advanceUntil)
+      yield* VirtualTime.quiet("5 seconds")
+      const later = Array.from(new Set(pulls.slice(before).map((time) => time - pulls[before])))
+
+      assert.deepStrictEqual(later, [0, 1000], "the call after one new failure waited the first delay")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "starts over when the space is made foreground with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { pulls, server, space } = yield* failingServer(constructor, true)
+      server.failures = 3
+      yield* VirtualTime.quiet("3500 millis")
+      const inTheBackground = Array.from(new Set(pulls.map((time) => time - pulls[0])))
+      const before = pulls.length
+
+      yield* VirtualTime.advanceUntil(space.activate)
+      yield* VirtualTime.quiet("500 millis")
+
+      assert.deepStrictEqual(inTheBackground, [0, 1000, 3000])
+      assert.strictEqual(pulls[before] - pulls[0], 3500, "the foreground sync did not wait for the background position")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "holds back the turn that follows a turn retired just as its call failed with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* BackgroundReplica.services({
+        constructor,
+        clientId,
+        initialSpaces: [spaceId],
+        maximumActiveSpaces: 4,
+        foregroundActiveSpaces: 2,
+        retryDelay: "1 second",
+        maximumRetryDelay: "1 minute"
+      })
+      yield* BackgroundReplica.seedPending(services, [spaceId])
+      const calling = yield* Deferred.make<void>()
+      const failing = yield* Deferred.make<void, ReplicaError.ServerUnavailable>()
+      const pulls: Array<number> = []
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) =>
+          Clock.currentTimeMillis.pipe(
+            Effect.flatMap((now) => {
+              pulls.push(now)
+              if (pulls.length > 1) return Effect.void
+              return Effect.andThen(Deferred.succeed(calling, undefined), Deferred.await(failing))
+            }),
+            Effect.andThen(emptyPage(services.crypto, request))
+          )
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* VirtualTime.advanceUntil(Deferred.await(calling))
+
+      const reporting = yield* services.holdStatement("effect_local_client_pending_data", true)
+      yield* Deferred.fail(failing, new ReplicaError.ServerUnavailable())
+      yield* VirtualTime.advanceUntil(reporting.entered)
+      yield* VirtualTime.advanceUntil(space.deactivate)
+      yield* reporting.release
+      yield* VirtualTime.quiet("5 seconds")
+
+      assert.strictEqual(pulls[1] - pulls[0], 1000, "the next call waited the first delay")
+    }, VirtualTime.scoped)
+  )
+})
+
+describe("a foreground operation that is turned away while its space is being left", () => {
+  it.effect.each(constructors)(
+    "does not start a background turn when the leave fails with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { pulls, replica, services, space } = yield* failingServer(constructor, false)
+      yield* VirtualTime.advanceUntil(space.activate)
+      yield* VirtualTime.quiet("1 second")
+      const removal = yield* services.holdStatement("DELETE FROM effect_local_client_spaces")
+      const leaving = yield* replica.leave(spaceId).pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(removal.entered)
+
+      const turnedAway = yield* within(space.get(Domain.Todo, "x"))
+      const before = pulls.length
+      yield* removal.release
+      const left = yield* VirtualTime.advanceUntil(Fiber.join(leaving))
+      yield* VirtualTime.quiet("1 minute")
+
+      assert.strictEqual(describeExit(turnedAway), "failed")
+      assert.isTrue(Exit.isFailure(left), "the leave failed at its delete")
+      assert.strictEqual(pulls.length, before, "no sync was started for the space")
     }, VirtualTime.scoped)
   )
 })
