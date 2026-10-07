@@ -185,10 +185,6 @@ interface RememberedEntry {
   backgroundFailure: ReplicaError.ReplicaError | undefined
 }
 
-type BackgroundWork =
-  | { readonly _tag: "Sync"; readonly spaceId: Identity.SpaceId }
-  | { readonly _tag: "Deactivate"; readonly entry: RememberedEntry; readonly runtime: ActiveRuntime }
-
 interface RetryWork {
   readonly entry: RememberedEntry
   readonly version: number
@@ -358,7 +354,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       }
       const retryTiming = yield* Configuration.retryTiming(options)
       const backgroundQueue = yield* Effect.acquireRelease(
-        Queue.unbounded<BackgroundWork>(),
+        Queue.unbounded<Identity.SpaceId>(),
         Queue.shutdown
       )
       const retryQueue = yield* Effect.acquireRelease(
@@ -754,7 +750,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             return Effect.void
           }
           backgroundQueued.add(entry.spaceId)
-          return Queue.offer(backgroundQueue, { _tag: "Sync", spaceId: entry.spaceId }).pipe(Effect.asVoid)
+          return Queue.offer(backgroundQueue, entry.spaceId).pipe(Effect.asVoid)
         })
 
       const noteServerFailure = (entry: RememberedEntry) =>
@@ -1289,9 +1285,10 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (holder === "BackgroundTurn" || entry.leases > 0 || !background || runtime === undefined) {
             return signalCapacity
           }
-          return signalCapacity.pipe(
-            Effect.andThen(Queue.offer(backgroundQueue, { _tag: "Deactivate", entry, runtime })),
-            Effect.asVoid
+          return closeReleasedRuntime(entry, runtime).pipe(
+            Effect.provideService(ConnectionLane.Priority, "Background"),
+            Effect.forkIn(parentScope),
+            Effect.andThen(signalCapacity)
           )
         })
 
@@ -1890,18 +1887,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         entries.get(entry.spaceId) === entry && !entry.leaving && entry.activation === "Active" &&
         entry.runtime !== undefined && !entry.runtime.foreground
 
-      const runBackgroundWork = Effect.fnUntraced(function*(
-        work: BackgroundWork,
-        entry: RememberedEntry,
-        generation: number
-      ) {
-        if (work._tag === "Deactivate") {
-          const result = yield* Effect.result(deactivate(entry, false, work.runtime, false))
-          if (Result.isFailure(result)) {
-            yield* settleBackgroundTurn(entry, generation, result.failure, Option.none())
-          }
-          return
-        }
+      const runBackgroundTurn = Effect.fnUntraced(function*(entry: RememberedEntry, generation: number) {
         if (entry.leaving) {
           entry.dueWhileLeaving = true
           return
@@ -1969,10 +1955,10 @@ const makeLayer = <D extends Definition.Any, R,>(
         )
       })
 
-      const settledBackgroundWork = (work: BackgroundWork, entry: RememberedEntry) =>
+      const settledBackgroundWork = (entry: RememberedEntry, work: (generation: number) => Effect.Effect<void>) =>
         Effect.suspend(() => {
           const generation = entry.backgroundGeneration
-          return runBackgroundWork(work, entry, generation).pipe(
+          return work(generation).pipe(
             Effect.catchCause((cause) =>
               settleDiedTurn(entry, generation, cause).pipe(
                 Effect.catchCause((settleCause) =>
@@ -1985,17 +1971,20 @@ const makeLayer = <D extends Definition.Any, R,>(
           )
         })
 
+      const closeReleasedRuntime = (entry: RememberedEntry, runtime: ActiveRuntime) =>
+        settledBackgroundWork(entry, (generation) =>
+          deactivate(entry, false, runtime, false).pipe(
+            Effect.asVoid,
+            Effect.catch((failure) => settleBackgroundTurn(entry, generation, failure, Option.none()))
+          ))
+
       const backgroundTurn = Effect.gen(function*() {
-        const work = yield* LosslessQueue.take(backgroundQueue)
-        if (work._tag === "Deactivate") {
-          yield* settledBackgroundWork(work, work.entry)
-          return
-        }
-        backgroundQueued.delete(work.spaceId)
-        const entry = entries.get(work.spaceId)
+        const spaceId = yield* LosslessQueue.take(backgroundQueue)
+        backgroundQueued.delete(spaceId)
+        const entry = entries.get(spaceId)
         if (entry === undefined) return
         entry.turnRunning = true
-        yield* settledBackgroundWork(work, entry)
+        yield* settledBackgroundWork(entry, (generation) => runBackgroundTurn(entry, generation))
         entry.turnRunning = false
         const due = entry.turnDue
         entry.turnDue = false
