@@ -179,6 +179,8 @@ interface RememberedEntry {
   serverFailures: number
   retryNotBefore: number
   turnRetired: boolean
+  turnRunning: boolean
+  turnDue: boolean
   backgroundGeneration: number
   backgroundFailure: ReplicaError.ReplicaError | undefined
 }
@@ -746,6 +748,10 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (resetRetry) {
             entry.retryAttempt = 0
             entry.backgroundGeneration += 1
+          }
+          if (entry.turnRunning) {
+            entry.turnDue = true
+            return Effect.void
           }
           backgroundQueued.add(entry.spaceId)
           return Queue.offer(backgroundQueue, { _tag: "Sync", spaceId: entry.spaceId }).pipe(Effect.asVoid)
@@ -1669,6 +1675,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           serverFailures: 0,
           retryNotBefore: 0,
           turnRetired: false,
+          turnRunning: false,
+          turnDue: false,
           backgroundGeneration: 0,
           backgroundFailure: undefined
         }
@@ -1956,29 +1964,37 @@ const makeLayer = <D extends Definition.Any, R,>(
         )
       })
 
-      const backgroundTurn = Effect.gen(function*() {
-        const work = yield* LosslessQueue.take(backgroundQueue)
-        let entry: RememberedEntry | undefined
-        if (work._tag === "Deactivate") {
-          entry = work.entry
-        } else {
-          backgroundQueued.delete(work.spaceId)
-          entry = entries.get(work.spaceId)
-        }
-        if (entry === undefined) return
-        const claimed = entry
-        const generation = claimed.backgroundGeneration
-        yield* runBackgroundWork(work, claimed, generation).pipe(
-          Effect.catchCause((cause) =>
-            settleDiedTurn(claimed, generation, cause).pipe(
-              Effect.catchCause((settleCause) =>
-                Errors.logDefect("Background turn settlement died", settleCause).pipe(
-                  Effect.annotateLogs({ "space.id": claimed.spaceId })
+      const settledBackgroundWork = (work: BackgroundWork, entry: RememberedEntry) =>
+        Effect.suspend(() => {
+          const generation = entry.backgroundGeneration
+          return runBackgroundWork(work, entry, generation).pipe(
+            Effect.catchCause((cause) =>
+              settleDiedTurn(entry, generation, cause).pipe(
+                Effect.catchCause((settleCause) =>
+                  Errors.logDefect("Background turn settlement died", settleCause).pipe(
+                    Effect.annotateLogs({ "space.id": entry.spaceId })
+                  )
                 )
               )
             )
           )
-        )
+        })
+
+      const backgroundTurn = Effect.gen(function*() {
+        const work = yield* LosslessQueue.take(backgroundQueue)
+        if (work._tag === "Deactivate") {
+          yield* settledBackgroundWork(work, work.entry)
+          return
+        }
+        backgroundQueued.delete(work.spaceId)
+        const entry = entries.get(work.spaceId)
+        if (entry === undefined) return
+        entry.turnRunning = true
+        yield* settledBackgroundWork(work, entry)
+        entry.turnRunning = false
+        const due = entry.turnDue
+        entry.turnDue = false
+        if (due && !hasForegroundRuntime(entry)) yield* enqueueBackground(entry, false)
       })
 
       yield* Effect.forEach(
