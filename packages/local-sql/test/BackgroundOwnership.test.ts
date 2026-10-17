@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
+import * as Scheduler from "effect/Scheduler"
 import * as Scope from "effect/Scope"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
@@ -182,6 +183,7 @@ const turnTakenDuringLeave = Effect.fnUntraced(function*() {
   const leave = Effect.result(replica.leave(spaceId))
   const leaving = yield* space.deactivate.pipe(
     Effect.andThen(leave),
+    Effect.provideService(Scheduler.PreventSchedulerYield, true),
     Effect.forkChild({ startImmediately: true })
   )
   yield* removal.entered
@@ -336,12 +338,13 @@ describe("background turns that settle after their space was left", () => {
       const bookkeeping = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
       const attempts = yield* makeAttempts
       const credentialChanged = yield* Deferred.make<void>()
+      const foregroundPulled = yield* Deferred.make<void>()
       let foreground = false
       const replica = yield* services.start(SyncEngine.SyncEngine.of({
         ...idleRemote,
         waitForCredentialChange: () => Deferred.await(credentialChanged),
         pull: () => {
-          if (foreground) return Effect.never
+          if (foreground) return Effect.andThen(Deferred.succeed(foregroundPulled, undefined), Effect.never)
           if (attempts.count() === 0) bookkeeping.arm(2)
           if (attempts.count() < 2) {
             return Effect.andThen(
@@ -357,6 +360,7 @@ describe("background turns that settle after their space was left", () => {
       const rejoined = yield* replica.join(spaceId)
       foreground = true
       yield* rejoined.mutate(Domain.PutTodo, Domain.todo("again"))
+      yield* Deferred.await(foregroundPulled)
       foreground = false
       yield* rejoined.deactivate
       yield* attempts.reached(2)
@@ -777,12 +781,13 @@ describe("review 225 suspicions that did not reproduce", () => {
       const bookkeeping = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
       const attempts = yield* makeAttempts
       const credentialChanged = yield* Deferred.make<void>()
+      const foregroundPulled = yield* Deferred.make<void>()
       let foreground = false
       const replica = yield* services.start(SyncEngine.SyncEngine.of({
         ...idleRemote,
         waitForCredentialChange: () => Deferred.await(credentialChanged),
         pull: () => {
-          if (foreground) return Effect.never
+          if (foreground) return Effect.andThen(Deferred.succeed(foregroundPulled, undefined), Effect.never)
           if (attempts.count() === 0) bookkeeping.arm(2)
           if (attempts.count() < 2) {
             return Effect.andThen(
@@ -798,6 +803,7 @@ describe("review 225 suspicions that did not reproduce", () => {
       const rejoined = yield* replica.join(spaceId)
       foreground = true
       yield* rejoined.mutate(Domain.PutTodo, Domain.todo("again"))
+      yield* Deferred.await(foregroundPulled)
       foreground = false
       yield* rejoined.deactivate
       yield* attempts.reached(2)

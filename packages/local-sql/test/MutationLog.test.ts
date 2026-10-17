@@ -221,6 +221,7 @@ const directSync = (server: ServerStore.Service) =>
     SyncEngine.SyncEngine,
     SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
+      credentialGeneration: Effect.succeed(0),
       transportGeneration: Effect.succeed(0),
       waitForTransportChange: () => Effect.never,
       submitBatch: (request) => server.admitBatch(request, null),
@@ -2511,6 +2512,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const remote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        credentialGeneration: Effect.succeed(0),
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
@@ -3480,6 +3482,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
     )
     const remote = SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
+      credentialGeneration: Effect.succeed(0),
       transportGeneration: Effect.succeed(0),
       waitForTransportChange: () => Effect.never,
       discard: () => Effect.die("unexpected discard"),
@@ -3572,6 +3575,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const expiredSnapshot = Identity.SnapshotId.make("snp_00000000-0000-4000-8000-0000000000ff")
       const remote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        credentialGeneration: Effect.succeed(0),
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
@@ -3632,6 +3636,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const remote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        credentialGeneration: Effect.succeed(0),
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
@@ -4131,6 +4136,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          credentialGeneration: Effect.succeed(0),
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
@@ -4180,6 +4186,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          credentialGeneration: Effect.succeed(0),
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           waitForCredentialChange: () =>
@@ -4242,6 +4249,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          credentialGeneration: Effect.succeed(0),
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           waitForCredentialChange: () =>
@@ -4299,6 +4307,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          credentialGeneration: Effect.succeed(0),
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           waitForCredentialChange: () =>
@@ -4390,6 +4399,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          credentialGeneration: Effect.succeed(0),
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
@@ -4445,6 +4455,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          credentialGeneration: Effect.succeed(0),
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
@@ -4486,6 +4497,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          credentialGeneration: Effect.succeed(0),
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
@@ -4525,6 +4537,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const syncEngine = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        credentialGeneration: Effect.succeed(0),
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
@@ -4560,6 +4573,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          credentialGeneration: Effect.succeed(0),
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
@@ -4600,6 +4614,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          credentialGeneration: Effect.succeed(0),
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),

@@ -8,6 +8,7 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
@@ -26,7 +27,7 @@ import * as ConnectionLane from "./ConnectionLane.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
-import { credentialChange, superviseWatch } from "./internal/transport.js"
+import { credentialChange, makeRetryPosition, superviseWatch } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as Reconciler from "./Reconciler.js"
 import * as SyncEngine from "./SyncEngine.js"
@@ -133,8 +134,16 @@ export const Execution = Schema.Struct({
 })
 export type Execution = typeof Execution.Type
 
+export interface ActiveExecution {
+  readonly workflow: ReturnType<typeof make>
+  readonly payload: Payload
+  readonly executionId: string
+}
+
 export interface RegistrationService {
   readonly registered: true
+  readonly activeExecution: Ref.Ref<Option.Option<ActiveExecution>>
+  readonly cancelExecution: Effect.Effect<void>
 }
 
 export class Registration extends Context.Service<Registration, RegistrationService>()(
@@ -152,10 +161,13 @@ export interface RuntimeServices {
 
 export interface RuntimeLeaseService {
   readonly acquire: Effect.Effect<RuntimeServices, ReplicaError.ReplicaError, Scope.Scope>
-  readonly admit: <A, E extends { readonly _tag: string }, R,>(
-    effect: Effect.Effect<A, E, R>
-  ) => Effect.Effect<A, E, R>
+  readonly attempt: <A,>(
+    execute: (runtime: RuntimeServices) => Effect.Effect<A, ReplicaError.ReplicaError>,
+    runtime: RuntimeNeed
+  ) => Effect.Effect<A, ReplicaError.ReplicaError>
 }
+
+export type RuntimeNeed = "WhenThereIsPendingWork" | "Always"
 
 export class RuntimeLease extends Context.Service<RuntimeLease, RuntimeLeaseService>()(
   "@lucas-barake/effect-local-sql/ReconciliationWorkflow/RuntimeLease"
@@ -285,6 +297,7 @@ const handler = (
     })
     const runActivity = Effect.fnUntraced(function*(
       name: string,
+      need: RuntimeNeed,
       execute: (runtime: RuntimeServices) => Effect.Effect<void, ReplicaError.ReplicaError>
     ) {
       let attempt = 1
@@ -293,18 +306,21 @@ const handler = (
         const result = yield* Activity.make({
           name: `${name}/${attempt}`,
           error: ReplicaError.ReplicaError,
-          execute: Effect.scoped(Effect.gen(function*() {
-            const runtime = yield* lease.acquire
-            if (runtime.local.membershipIncarnation !== membershipIncarnation) {
-              return yield* new ReplicaError.SpaceUnavailable({ spaceId: payload.spaceId })
-            }
-            observedGeneration = yield* runtime.reconciliation.generation
-            return yield* lease.admit(execute(runtime))
-          }))
+          execute: lease.attempt(
+            Effect.fnUntraced(function*(runtime) {
+              if (runtime.local.membershipIncarnation !== membershipIncarnation) {
+                return yield* new ReplicaError.SpaceUnavailable({ spaceId: payload.spaceId })
+              }
+              observedGeneration = yield* runtime.reconciliation.generation
+              return yield* execute(runtime)
+            }),
+            need
+          )
         }).pipe(Effect.result)
         if (Result.isSuccess(result)) return
         yield* Effect.scoped(Effect.gen(function*() {
           const runtime = yield* lease.acquire
+          yield* validateScope(runtime.local)
           const generation = observedGeneration ?? (yield* runtime.reconciliation.generation)
           yield* runtime.reconciliation.failed(result.failure, generation)
         }))
@@ -321,8 +337,12 @@ const handler = (
       }
     })
 
-    yield* runActivity("sync", ({ local, reconciliation }) => Effect.andThen(validateScope(local), reconciliation.sync))
-    yield* runActivity("complete", ({ local }) =>
+    yield* runActivity(
+      "sync",
+      "WhenThereIsPendingWork",
+      ({ local, reconciliation }) => Effect.andThen(validateScope(local), reconciliation.sync)
+    )
+    yield* runActivity("complete", "Always", ({ local }) =>
       Effect.andThen(validateScope(local), local.completeReconciliation(payload.generation)))
     yield* Effect.scoped(Effect.gen(function*() {
       const runtime = yield* lease.acquire
@@ -403,7 +423,26 @@ const register = Effect.fnUntraced(function*(
       })
     ).pipe(Scope.provide(registrationScope))
   }
-  return Registration.of({ registered: true })
+  const activeExecution = yield* Ref.make(Option.none<ActiveExecution>())
+  const cancelExecution = Effect.gen(function*() {
+    const active = yield* Ref.get(activeExecution)
+    if (Option.isNone(active)) return
+    const tracked = active.value
+    const interruptTracked = engine.interruptUnsafe(tracked.workflow, tracked.executionId)
+    const forget = Ref.set(activeExecution, Option.none())
+    yield* engine.poll(tracked.workflow, tracked.executionId).pipe(
+      Effect.onError((cause) => {
+        if (Cause.hasInterruptsOnly(cause)) return Effect.void
+        return Effect.andThen(interruptTracked, forget)
+      }),
+      Effect.flatMap(Option.match({
+        onNone: () => interruptTracked,
+        onSome: () => Effect.void
+      })),
+      Effect.andThen(forget)
+    )
+  })
+  return Registration.of({ registered: true, activeExecution, cancelExecution })
 })
 
 const layerRegistrationWithConfiguration = (
@@ -425,7 +464,7 @@ const layerRegistrationWithConfiguration = (
     )
     const lease = RuntimeLease.of({
       acquire: Effect.succeed({ local, reconciliation }),
-      admit: (effect) => effect
+      attempt: (execute) => execute({ local, reconciliation })
     })
     return Layer.succeed(
       Registration,
@@ -501,16 +540,11 @@ const layerSchedulerWithConfiguration = (
       const local = yield* LocalStore.Store
       const reconciliation = yield* Reconciler.Reconciliation
       const workflowOwner = Option.getOrUndefined(yield* Effect.serviceOption(RegistrationScope))
-      yield* Registration
+      const registration = yield* Registration
+      const activeExecution = registration.activeExecution
       const remote = yield* SyncEngine.SyncEngine
       const engine = yield* WorkflowEngine.WorkflowEngine
       const wake = yield* Queue.sliding<void>(1)
-      const activeExecution = yield* Ref.make<
-        Option.Option<{
-          readonly workflow: ReturnType<typeof make>
-          readonly executionId: string
-        }>
-      >(Option.none())
       const notify = Queue.offer(wake, undefined).pipe(Effect.asVoid)
       const requestAndNotify = local.requestReconciliation.pipe(Effect.andThen(notify))
       let resyncRequested = false
@@ -566,7 +600,25 @@ const layerSchedulerWithConfiguration = (
         )
       }
 
-      let retryAttempt = 0
+      const liveExecution = Effect.gen(function*() {
+        const adopted = yield* Ref.get(activeExecution)
+        if (Option.isNone(adopted)) return adopted
+        const running = adopted.value
+        const polled = yield* engine.poll(running.workflow, running.executionId)
+        if (Option.isSome(polled) && polled.value._tag === "Complete") {
+          yield* Ref.set(activeExecution, Option.none())
+          return Option.none<ActiveExecution>()
+        }
+        const state = yield* local.replicationState
+        if (running.payload.scopeGeneration === state.scopeGeneration) return adopted
+        yield* Ref.set(activeExecution, Option.none())
+        return Option.none<ActiveExecution>()
+      })
+      const position = yield* makeRetryPosition({
+        timing: configuration,
+        pending: Effect.map(reconciliation.status, (current) => current.pending),
+        retry: resyncAfterWatchFailure
+      })
       let readmit = false
       const superviseTurn = Effect.gen(function*() {
         if (!readmit) yield* LosslessQueue.take(wake)
@@ -580,24 +632,33 @@ const layerSchedulerWithConfiguration = (
           while (true) {
             yield* awaitAuthenticationChange
             observedGeneration = yield* reconciliation.generation
-            const generations = yield* local.reconciliationGenerations
-            if (generations.completed >= generations.requested) return
-            const state = yield* local.replicationState
-            const payload = Payload.make({
-              schemaIdentity: schemaIdentityKey(options.definition),
-              spaceId: options.spaceId,
-              clientId: options.clientId,
-              membershipIncarnation: local.membershipIncarnation,
-              scope: state.scope,
-              scopeGeneration: state.scopeGeneration,
-              generation: generations.requested
-            })
-            const workflow = make(payload)
-            const activeExecutionId = yield* workflow.executionId(payload)
-            yield* Ref.set(activeExecution, Option.some({ workflow, executionId: activeExecutionId }))
-            const clearExecution = Ref.set(activeExecution, Option.none())
-            yield* workflow.execute(payload).pipe(Effect.ensuring(clearExecution))
-            retryAttempt = 0
+            const live = yield* liveExecution
+            let running: ActiveExecution
+            if (Option.isSome(live)) {
+              running = live.value
+            } else {
+              const generations = yield* local.reconciliationGenerations
+              if (generations.completed >= generations.requested) return
+              const state = yield* local.replicationState
+              const payload = Payload.make({
+                schemaIdentity: schemaIdentityKey(options.definition),
+                spaceId: options.spaceId,
+                clientId: options.clientId,
+                membershipIncarnation: local.membershipIncarnation,
+                scope: state.scope,
+                scopeGeneration: state.scopeGeneration,
+                generation: generations.requested
+              })
+              const workflow = make(payload)
+              running = { workflow, payload, executionId: yield* workflow.executionId(payload) }
+              yield* Ref.set(activeExecution, Option.some(running))
+            }
+            yield* running.workflow.execute(running.payload).pipe(
+              Effect.onExit((exit) => {
+                if (Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) return Effect.void
+                return Ref.set(activeExecution, Option.none())
+              })
+            )
           }
         }).pipe(
           Errors.failDiedIteration(
@@ -610,8 +671,12 @@ const layerSchedulerWithConfiguration = (
           ),
           Effect.result
         )
-        if (Result.isSuccess(result)) return false
+        if (Result.isSuccess(result)) {
+          yield* position.retryUnfinished
+          return false
+        }
         const error = result.failure
+        yield* position.cancelStalledRetry
         if (error._tag === "CredentialRejected") {
           if (error.credentialGeneration === undefined) {
             yield* reconciliation.failed(error, observedGeneration)
@@ -622,7 +687,7 @@ const layerSchedulerWithConfiguration = (
           yield* reconciliation.failed(error, observedGeneration)
           yield* startCredentialWait(error.credentialGeneration, admission)
           yield* Deferred.await(admission.gate)
-          retryAttempt = 0
+          position.reset()
           readmit = true
           return false
         }
@@ -634,9 +699,8 @@ const layerSchedulerWithConfiguration = (
         }
         yield* reconciliation.failed(error, observedGeneration)
         if (Reconciler.isTransientFailure(error)) {
-          retryAttempt += 1
           yield* Effect.logWarning("Reconciliation supervisor will retry", error)
-          yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
+          yield* Effect.sleep(position.nextDelay())
           readmit = true
           return false
         }
@@ -683,9 +747,12 @@ const layerSchedulerWithConfiguration = (
           }
           if (error._tag === "CredentialRejected") {
             if (error.credentialGeneration === undefined) {
+              const rejectedAt = yield* reconciliation.generation
               yield* reconciliation.watchFailed(error)
               yield* Effect.logWarning("Rejected watch credential did not include its generation")
-              return
+              yield* reconciliation.syncedAfter(rejectedAt)
+              yield* Effect.sleep(yield* watchBackoff.closed)
+              continue
             }
             const admission = yield* admitCredentialPause
             yield* reconciliation.watchFailed(error)
@@ -723,19 +790,7 @@ const layerSchedulerWithConfiguration = (
         )
       })
 
-      const shutdown = Effect.gen(function*() {
-        const active = yield* Ref.get(activeExecution)
-        const supervisorInterruption = yield* Effect.forkChild(Fiber.interrupt(supervisorFiber), {
-          startImmediately: true
-        })
-        if (Option.isSome(active)) {
-          const result = yield* engine.poll(active.value.workflow, active.value.executionId)
-          if (Option.isNone(result)) {
-            yield* engine.interruptUnsafe(active.value.workflow, active.value.executionId)
-          }
-        }
-        yield* Fiber.join(supervisorInterruption)
-      })
+      const shutdown = Fiber.interrupt(supervisorFiber)
       return Reconciler.Reconciler.of({
         sync: reconciliation.sync,
         notify,

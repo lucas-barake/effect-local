@@ -62,6 +62,7 @@ const collectGarbage = Effect.promise(() => exposedGc({ execution: "async" }))
 const layerReplica = (onWatchCount: (change: number) => void, layerServices: Layer.Layer<any>) => {
   const remote = SyncEngine.SyncEngine.of({
     waitForCredentialChange: () => Effect.never,
+    credentialGeneration: Effect.succeed(0),
     transportGeneration: Effect.succeed(0),
     waitForTransportChange: () => Effect.never,
     submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),

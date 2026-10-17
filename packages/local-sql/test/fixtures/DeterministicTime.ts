@@ -121,3 +121,10 @@ export const advanceUntil = Effect.fnUntraced(function*<A, E extends { readonly 
     if (!advanced) return yield* Effect.die("Nothing is running and no sleep is pending, so the wait cannot finish")
   }
 })
+
+export const quiet = (duration: Duration.Input) => advanceUntil(Effect.never).pipe(Effect.timeoutOption(duration))
+
+export const atBudget = <A, E extends { readonly _tag: string }, R,>(
+  effect: Effect.Effect<A, E, R>,
+  row: { readonly budget: number }
+) => scoped(effect).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, row.budget))

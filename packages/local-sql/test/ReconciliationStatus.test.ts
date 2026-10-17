@@ -69,6 +69,7 @@ const layerDirectSync = Layer.effect(
     const server = yield* ServerStore.ServerStore
     return SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
+      credentialGeneration: Effect.succeed(0),
       transportGeneration: Effect.succeed(0),
       waitForTransportChange: () => Effect.never,
       submitBatch: (request) => server.admitBatch(request, null),
@@ -112,6 +113,7 @@ const makeControlledReconciliation = Effect.gen(function*() {
     SyncEngine.SyncEngine,
     SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
+      credentialGeneration: Effect.succeed(0),
       transportGeneration: Effect.succeed(0),
       waitForTransportChange: () => Effect.never,
       submitBatch: (request) => server.admitBatch(request, null),
@@ -284,6 +286,7 @@ describe("reconciliation status", () => {
       const remote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () =>
           Deferred.succeed(awaitingCredential, undefined).pipe(Effect.andThen(Deferred.await(credentialChanged))),
+        credentialGeneration: Effect.succeed(0),
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Deferred.succeed(backingOff, undefined).pipe(Effect.andThen(Effect.never)),
         submitBatch: (request) => server.admitBatch(request, null),
@@ -338,6 +341,7 @@ describe("reconciliation status", () => {
       const wakes = 20
       const remote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        credentialGeneration: Effect.succeed(0),
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
         submitBatch: (request) => server.admitBatch(request, null),
@@ -385,6 +389,7 @@ describe("reconciliation status", () => {
       const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
       const direct = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        credentialGeneration: Effect.succeed(0),
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
         submitBatch: (request) => server.admitBatch(request, null),

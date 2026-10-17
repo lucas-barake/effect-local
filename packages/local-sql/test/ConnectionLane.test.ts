@@ -527,6 +527,7 @@ const recordingRemote = Effect.fnUntraced(function*(reachable: boolean) {
   const unreachable = Effect.fail(new ReplicaError.ServerUnavailable())
   const remote = SyncEngine.SyncEngine.of({
     waitForCredentialChange: () => Effect.never,
+    credentialGeneration: Effect.succeed(0),
     transportGeneration: Effect.succeed(0),
     waitForTransportChange: () => Effect.never,
     submitBatch: (request) => {
@@ -643,6 +644,7 @@ describe("Reconciliation on a connection lane", () => {
       const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
       const remote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        credentialGeneration: Effect.succeed(0),
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
         submitBatch: (request) => server.admitBatch(request, null),

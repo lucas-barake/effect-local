@@ -26,6 +26,7 @@ export const layer: Layer.Layer<
     })
     return SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
+      credentialGeneration: Effect.succeed(0),
       transportGeneration: Effect.succeed(0),
       waitForTransportChange: () => Effect.never,
       submitBatch: Effect.fnUntraced(function*(request) {

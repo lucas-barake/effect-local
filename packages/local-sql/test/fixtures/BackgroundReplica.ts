@@ -16,6 +16,7 @@ import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as Logger from "effect/Logger"
 import * as Option from "effect/Option"
+import * as Predicate from "effect/Predicate"
 import * as Queue from "effect/Queue"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Scope from "effect/Scope"
@@ -24,6 +25,7 @@ import * as SqlError from "effect/sql/SqlError"
 import * as Statement from "effect/sql/Statement"
 import * as Stream from "effect/Stream"
 import * as WorkflowEngine from "effect/workflow/WorkflowEngine"
+import type * as ReconciliationWorkflow from "../../src/ReconciliationWorkflow.js"
 import * as SqlReplica from "../../src/SqlReplica.js"
 import * as SyncEngine from "../../src/SyncEngine.js"
 import * as Domain from "../Domain.js"
@@ -39,6 +41,7 @@ export type Remote = SyncEngine.SyncEngine["Service"]
 
 export const idleRemote = SyncEngine.SyncEngine.of({
   waitForCredentialChange: () => Effect.never,
+  credentialGeneration: Effect.succeed(0),
   transportGeneration: Effect.succeed(0),
   waitForTransportChange: () => Effect.never,
   submitBatch: () => Effect.never,
@@ -108,7 +111,12 @@ export interface Settings {
   readonly foregroundActiveSpaces: number
   readonly retryDelay: Duration.Input
   readonly maximumRetryDelay: Duration.Input
+  readonly reconciliationConcurrency?: number
 }
+
+const isPollable = (
+  value: unknown
+): value is ReturnType<typeof ReconciliationWorkflow.make> => Predicate.hasProperty(value, "_tag")
 
 const isStatement = (value: unknown): value is Statement.Statement<unknown> =>
   Statement.isFragment(value) && Effect.isEffect(value)
@@ -162,7 +170,12 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
   })
   const crypto = Context.get(databaseContext, Crypto.Crypto)
   const reactivity = Context.get(databaseContext, Reactivity.Reactivity)
+  let concurrency: { readonly reconciliationConcurrency?: number } = {}
+  if (settings.reconciliationConcurrency !== undefined) {
+    concurrency = { reconciliationConcurrency: settings.reconciliationConcurrency }
+  }
   const options = {
+    ...concurrency,
     definition: Domain.definition,
     clientId: settings.clientId,
     initialSpaces: settings.initialSpaces,
@@ -190,10 +203,25 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
       readonly release: Deferred.Deferred<void>
     }
     | undefined
+  let heldKeys:
+    | {
+      readonly keys: ReadonlySet<unknown>
+      readonly entered: Set<unknown>
+      readonly release: Deferred.Deferred<void>
+    }
+    | undefined
   const gatedReactivity = new Proxy(reactivity, {
     get: (target, property, receiver) => {
       if (property !== "invalidate") return Reflect.get(target, property, receiver)
       return (keys: Parameters<typeof reactivity.invalidate>[0]) => {
+        const holding = heldKeys
+        if (holding !== undefined && Array.isArray(keys)) {
+          const key: unknown = keys.find((candidate) => holding.keys.has(candidate))
+          if (key !== undefined) {
+            holding.entered.add(key)
+            return target.invalidate(keys).pipe(Effect.andThen(Deferred.await(holding.release)))
+          }
+        }
         const replaced = invalidationOutcome
         if (replaced !== undefined && Array.isArray(keys) && keys.includes(replaced.key)) return replaced.outcome
         const held = heldInvalidation
@@ -213,9 +241,41 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
       }
     }
   })
+  const engine = Context.get(databaseContext, WorkflowEngine.WorkflowEngine)
+  const executions = new Map<string, Set<string>>()
+  const workflows = new Map<string, unknown>()
+  let workflowStorageDown: "No" | "Polls" | "PollsAndInterrupts" = "No"
+  let workflowInterrupts = 0
+  const countingEngine = new Proxy(engine, {
+    get: (target, property, receiver) => {
+      if (workflowStorageDown !== "No" && property === "poll") {
+        return () => Effect.die("workflow storage unavailable")
+      }
+      if (property === "interruptUnsafe") {
+        if (workflowStorageDown === "PollsAndInterrupts") return () => Effect.die("workflow storage unavailable")
+        return (...args: ReadonlyArray<unknown>): unknown => {
+          workflowInterrupts += 1
+          return Reflect.apply(target.interruptUnsafe, target, args)
+        }
+      }
+      if (property !== "execute") return Reflect.get(target, property, receiver)
+      return (...args: ReadonlyArray<unknown>): unknown => {
+        const [workflow, execution] = args
+        if (Predicate.hasProperty(workflow, "_tag") && Predicate.hasProperty(execution, "executionId")) {
+          const tag = String(workflow._tag)
+          const started = executions.get(tag) ?? new Set<string>()
+          started.add(String(execution.executionId))
+          executions.set(tag, started)
+          workflows.set(tag, workflow)
+        }
+        return Reflect.apply(target.execute, target, args)
+      }
+    }
+  })
   const lockingContext = databaseContext.pipe(
     Context.add(SqlClient.SqlClient, lockingSql),
-    Context.add(Reactivity.Reactivity, gatedReactivity)
+    Context.add(Reactivity.Reactivity, gatedReactivity),
+    Context.add(WorkflowEngine.WorkflowEngine, countingEngine)
   )
   const start = (remote: Remote) => {
     const layerServices = Layer.mergeAll(
@@ -255,6 +315,12 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     }
     return { arm, entered: Deferred.await(entered), release: Deferred.succeed(release, undefined) }
   })
+  const holdInvalidationsOf = Effect.fnUntraced(function*(keys: ReadonlyArray<string>) {
+    const release = yield* Deferred.make<void>()
+    const entered = new Set<unknown>()
+    heldKeys = { keys: new Set(keys), entered, release }
+    return { entered: () => entered.size, release: Deferred.succeed(release, undefined) }
+  })
   const holdInvalidationWhen = Effect.fnUntraced(function*(
     key: string,
     matches: (fiberId: number) => Effect.Effect<boolean>
@@ -268,6 +334,40 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     invalidationOutcome = { key, outcome }
   }
   const lockRemaining = () => locked?.remaining ?? 0
+  const workflowExecutions = (spaceId: Identity.SpaceId) => {
+    let started = 0
+    for (const [name, ids] of executions) {
+      if (name.includes(spaceId)) started += ids.size
+    }
+    return started
+  }
+  const runningWorkflowExecutions = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
+    let running = 0
+    for (const [name, ids] of executions) {
+      if (!name.includes(spaceId)) continue
+      for (const executionId of ids) {
+        const workflow = workflows.get(name)
+        if (!isPollable(workflow)) continue
+        const exit = yield* Effect.exit(engine.poll(workflow, executionId))
+        if (Exit.isSuccess(exit) && Option.isNone(exit.value)) running += 1
+      }
+    }
+    return running
+  })
+  const unfinishedWorkflowExecutions = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
+    let unfinished = 0
+    for (const [name, ids] of executions) {
+      if (!name.includes(spaceId)) continue
+      for (const executionId of ids) {
+        const workflow = workflows.get(name)
+        if (!isPollable(workflow)) continue
+        const exit = yield* Effect.exit(engine.poll(workflow, executionId))
+        if (!Exit.isSuccess(exit)) continue
+        if (Option.isNone(exit.value) || exit.value.value._tag === "Suspended") unfinished += 1
+      }
+    }
+    return unfinished
+  })
   return {
     sql,
     crypto,
@@ -279,7 +379,15 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     holdStatement,
     holdInvalidation,
     holdInvalidationWhen,
-    endInvalidationsWith
+    holdInvalidationsOf,
+    endInvalidationsWith,
+    workflowExecutions,
+    runningWorkflowExecutions,
+    unfinishedWorkflowExecutions,
+    workflowInterrupts: () => workflowInterrupts,
+    setWorkflowStorageDown: (down: "No" | "Polls" | "PollsAndInterrupts") => {
+      workflowStorageDown = down
+    }
   }
 })
 
@@ -342,6 +450,45 @@ export const eventually = (
 
 export const within = <A, E extends { readonly _tag: string },>(effect: Effect.Effect<A, E>) =>
   effect.pipe(Effect.exit, Effect.timeoutOption("5 minutes"), VirtualTime.advanceUntil)
+
+export const makeCapacityProbe = Effect.fnUntraced(function*(spaceIds: ReadonlyArray<Identity.SpaceId>) {
+  const release = yield* Deferred.make<void>()
+  let armed = false
+  let inFlight = 0
+  const held = <A, E extends { readonly _tag: string },>(spaceId: Identity.SpaceId, answer: Effect.Effect<A, E>) =>
+    Effect.suspend(() => {
+      if (!armed || !spaceIds.includes(spaceId)) return answer
+      inFlight += 1
+      return Deferred.await(release).pipe(
+        Effect.ensuring(Effect.sync(() => {
+          inFlight -= 1
+        })),
+        Effect.andThen(answer)
+      )
+    })
+  const fill = Effect.fnUntraced(
+    function*(background: Services, replica: Replica.Replica["Service"], home: Identity.SpaceId) {
+      armed = true
+      for (const spaceId of spaceIds) {
+        const space = yield* replica.space(spaceId)
+        yield* space.mutate(Domain.PutTodo, Domain.todo("probe")).pipe(VirtualTime.advanceUntil)
+      }
+      const current = yield* replica.space(home)
+      yield* current.mutate(Domain.PutTodo, Domain.todo("probe")).pipe(VirtualTime.advanceUntil)
+      const foregroundSynced = yield* eventually(background, current, isOnlineDrained)
+      yield* VirtualTime.quiet("1 minute")
+      const backgroundCallsAtOnce = inFlight
+      yield* Deferred.succeed(release, undefined)
+      let drained = 0
+      for (const spaceId of spaceIds) {
+        const space = yield* replica.space(spaceId)
+        if (Option.isSome(yield* eventually(background, space, (status) => status.pending === 0))) drained += 1
+      }
+      return { foregroundSynced: Option.isSome(foregroundSynced), backgroundCallsAtOnce, drained }
+    }
+  )
+  return { held, fill }
+})
 
 export const isOnlineDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
 

@@ -8,7 +8,7 @@ import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
-import type * as Cause from "effect/Cause"
+import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import type * as Crypto from "effect/Crypto"
@@ -40,7 +40,7 @@ import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
 import * as SqliteIdentifier from "./internal/sqliteIdentifier.js"
-import { credentialChange, isTransportFailure } from "./internal/transport.js"
+import { answeredUnderCredential, credentialChange, isTransportFailure } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as Migrations from "./Migrations.js"
 import * as MutationRuntime from "./MutationRuntime.js"
@@ -135,12 +135,15 @@ const CallerFiber = Context.Reference<number | undefined>("@lucas-barake/effect-
 const onCallerFiber = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
   Effect.withFiber((fiber) => Effect.provideService(effect, CallerFiber, fiber.id))
 
+type Restore = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
+
 interface ActiveRuntime {
   readonly foreground: boolean
   readonly scope: Scope.Closeable
   readonly operationGate: Semaphore.Semaphore
-  readonly quarantineGate: Semaphore.Semaphore
-  readonly preemption: Deferred.Deferred<void>
+  readonly workflowTurn: Semaphore.Semaphore
+  pendingRetirements: number
+  requestedRetirements: number
   readonly local: LocalStore.Service
   readonly queries: QueryExecutor.Service
   readonly reconciler: Reconciler.Service
@@ -148,15 +151,21 @@ interface ActiveRuntime {
   readonly cancelReconciliation: Effect.Effect<void>
 }
 
+interface Waiter {
+  retiring: ActiveRuntime | undefined
+}
+
 interface RememberedEntry {
   readonly spaceId: Identity.SpaceId
   readonly membershipIncarnation: Identity.MembershipIncarnation
+  readonly quarantineGate: Semaphore.Semaphore
   handle: Replica.Space
   activation: Replica.Activation
   runtime: ActiveRuntime | undefined
   transition: Completion.Completion<void, ReplicaError.ReplicaError> | undefined
   foreground: boolean
   foregroundDemand: number
+  callerLeases: number
   settlementsRecorded: Completion.Completion<void>
   leases: number
   leaving: boolean
@@ -166,13 +175,15 @@ interface RememberedEntry {
   summaryStatus: ReplicaStatus.ReplicaStatus
   synced: boolean
   retryAttempt: number
+  readonly remote: SyncEngine.Service
+  serverFailures: number
+  retryNotBefore: number
+  turnRetired: boolean
+  turnRunning: boolean
+  turnDue: boolean
   backgroundGeneration: number
   backgroundFailure: ReplicaError.ReplicaError | undefined
 }
-
-type BackgroundWork =
-  | { readonly _tag: "Sync"; readonly spaceId: Identity.SpaceId }
-  | { readonly _tag: "Deactivate"; readonly entry: RememberedEntry; readonly runtime: ActiveRuntime }
 
 interface RetryWork {
   readonly entry: RememberedEntry
@@ -267,11 +278,10 @@ const makeLayer = <D extends Definition.Any, R,>(
       const entries = new Map<Identity.SpaceId, RememberedEntry>()
       const joining = new Map<Identity.SpaceId, Completion.Completion<void>>()
       const foregroundResidents = new Map<Identity.SpaceId, RememberedEntry>()
-      const foregroundAdmitted = new Set<Identity.SpaceId>()
+      const foregroundQueue = new Set<Waiter>()
       const dropForegroundReservation = (entry: RememberedEntry) => {
         entry.foreground = false
         foregroundResidents.delete(entry.spaceId)
-        foregroundAdmitted.delete(entry.spaceId)
       }
       const aggregate = yield* Ref.make(aggregateStatus(0, 0, {
         idle: 0,
@@ -328,16 +338,79 @@ const makeLayer = <D extends Definition.Any, R,>(
         options.maximumActiveSpaces - options.foregroundActiveSpaces,
         reconciliationConcurrency - foregroundReconciliationConcurrency
       )
-      const backgroundActiveSpaces = yield* Semaphore.make(
-        options.maximumActiveSpaces - options.foregroundActiveSpaces
-      )
+      const backgroundRuntimeLimit = options.maximumActiveSpaces - options.foregroundActiveSpaces
+      let backgroundRuntimes = 0
+      const slotWaiters = new Set<Waiter>()
       const foregroundWorkflowTurns = yield* Semaphore.make(foregroundReconciliationConcurrency)
-      const backgroundWorkflowTurns = yield* Semaphore.make(
-        reconciliationConcurrency - foregroundReconciliationConcurrency
-      )
+      const backgroundWorkflowTurnLimit = reconciliationConcurrency - foregroundReconciliationConcurrency
+      const backgroundWorkflowTurns = yield* Semaphore.make(backgroundWorkflowTurnLimit)
+      let backgroundTurnsWanted = 0
+      const catchUpTurns = new Set<Completion.Completion<void>>()
+      const yieldCatchUps = Effect.suspend(() => {
+        const yielding = Array.from(catchUpTurns)
+        catchUpTurns.clear()
+        return Effect.forEach(yielding, (yielded) => Completion.settle(yielded, Exit.void), { discard: true })
+      })
+      const catchUpAdmitted = () =>
+        slotWaiters.size === 0 && backgroundQueued.size === 0 &&
+        backgroundTurnsWanted < backgroundWorkflowTurnLimit
+      const withWorkflowTurn = <A, E extends { readonly _tag: string },>(
+        runtime: ActiveRuntime,
+        turn: Effect.Effect<A, E>
+      ): Effect.Effect<A, E> => {
+        let turns = backgroundWorkflowTurns
+        if (runtime.foreground) turns = foregroundWorkflowTurns
+        return runtime.workflowTurn.withPermit(turns.withPermit(turn))
+      }
+      const wantBackgroundTurn = Effect.suspend(() => {
+        backgroundTurnsWanted += 1
+        if (backgroundTurnsWanted > backgroundWorkflowTurnLimit) return yieldCatchUps
+        return Effect.void
+      })
+      const giveBackBackgroundTurn = Effect.sync(() => {
+        backgroundTurnsWanted -= 1
+      })
+      const withAttemptTurn = <A, E extends { readonly _tag: string },>(
+        runtime: ActiveRuntime,
+        turn: Effect.Effect<A, E>
+      ): Effect.Effect<A, E> => {
+        if (runtime.foreground) return withWorkflowTurn(runtime, turn)
+        const permitted = backgroundWorkflowTurns.withPermit(turn)
+        const wanted = Effect.uninterruptibleMask((restore) =>
+          wantBackgroundTurn.pipe(
+            Effect.andThen(restore(permitted)),
+            Effect.ensuring(giveBackBackgroundTurn)
+          )
+        )
+        return runtime.workflowTurn.withPermit(wanted)
+      }
+      const withCatchUpTurn = <A, E extends { readonly _tag: string },>(
+        runtime: ActiveRuntime,
+        turn: Effect.Effect<A, E>
+      ): Effect.Effect<Option.Option<A>, E> => {
+        const admitted = Effect.uninterruptibleMask((restore) =>
+          Effect.suspend(() => {
+            if (!catchUpAdmitted()) return Effect.succeed(Option.none<A>())
+            const yielded = Completion.make<void>()
+            const yields = Completion.wait(yielded).pipe(Effect.as(Option.none<A>()))
+            backgroundTurnsWanted += 1
+            catchUpTurns.add(yielded)
+            return backgroundWorkflowTurns.withPermit(turn).pipe(
+              Effect.map(Option.some),
+              Effect.raceFirst(yields),
+              restore,
+              Effect.ensuring(Effect.sync(() => {
+                backgroundTurnsWanted -= 1
+                catchUpTurns.delete(yielded)
+              }))
+            )
+          })
+        )
+        return runtime.workflowTurn.withPermit(admitted)
+      }
       const retryTiming = yield* Configuration.retryTiming(options)
       const backgroundQueue = yield* Effect.acquireRelease(
-        Queue.unbounded<BackgroundWork>(),
+        Queue.unbounded<Identity.SpaceId>(),
         Queue.shutdown
       )
       const retryQueue = yield* Effect.acquireRelease(
@@ -544,13 +617,6 @@ const makeLayer = <D extends Definition.Any, R,>(
         childScope: Scope.Closeable
       ) {
         const spaceId = entry.spaceId
-        if (!foreground) {
-          yield* Effect.acquireRelease(
-            backgroundActiveSpaces.take(1),
-            () => backgroundActiveSpaces.release(1),
-            { interruptible: true }
-          ).pipe(Scope.provide(childScope))
-        }
         const replicationScope = yield* durableScope(spaceId)
         const layerMutationRuntime = MutationRuntime.layer(options.definition, options.evolution)
         const reconcilerReady = yield* Deferred.make<Reconciler.Service>()
@@ -594,7 +660,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             layerReconciliation
           ).pipe(
             Layer.buildWithScope(childScope),
-            Effect.provide(workflowContext),
+            Effect.provide(Context.add(workflowContext, SyncEngine.SyncEngine, entry.remote)),
             Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
           )
           local = Context.get(runtime, LocalStore.Store)
@@ -620,7 +686,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             reconciler = Reconciler.Reconciler.of({
               sync: reconciliation.sync,
               notify: local.requestReconciliation.pipe(Effect.asVoid),
-              schedule: Effect.void,
+              schedule: enqueueBackground(entry),
               status: reconciliation.status,
               shutdown: Effect.void
             })
@@ -639,7 +705,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             }).pipe(Layer.provide(layerLocalStore))
           ).pipe(
             Layer.buildWithScope(childScope),
-            Effect.provide(rootContext),
+            Effect.provide(Context.add(rootContext, SyncEngine.SyncEngine, entry.remote)),
             Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
           )
           local = Context.get(runtime, LocalStore.Store)
@@ -674,7 +740,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             reconciler = Reconciler.Reconciler.of({
               sync: reconciliation.sync,
               notify: local.requestReconciliation.pipe(Effect.asVoid),
-              schedule: Effect.void,
+              schedule: enqueueBackground(entry),
               status: reconciliation.status,
               shutdown: Effect.void
             })
@@ -682,14 +748,14 @@ const makeLayer = <D extends Definition.Any, R,>(
         }
         yield* Deferred.succeed(reconcilerReady, reconciler)
         const operationGate = yield* Semaphore.make(operationPermits)
-        const quarantineGate = yield* Semaphore.make(1)
-        const preemption = yield* Deferred.make<void>()
+        const workflowTurn = yield* Semaphore.make(1)
         return {
           foreground,
           scope: childScope,
           operationGate,
-          quarantineGate,
-          preemption,
+          workflowTurn,
+          pendingRetirements: 0,
+          requestedRetirements: 0,
           local,
           queries,
           reconciler,
@@ -698,20 +764,28 @@ const makeLayer = <D extends Definition.Any, R,>(
         } satisfies ActiveRuntime
       })
 
+      const releaseBackgroundSlot = Effect.suspend(() => {
+        backgroundRuntimes -= 1
+        return signalCapacity
+      })
+
       const initialize = (
         entry: RememberedEntry,
         generation: number,
-        foreground: boolean
+        foreground: boolean,
+        restore: Restore
       ): Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError> =>
-        Effect.uninterruptibleMask((restore) =>
-          Scope.fork(parentScope).pipe(
-            Effect.flatMap((childScope) =>
-              restore(buildRuntime(entry, generation, foreground, childScope)).pipe(
-                Effect.onExit((exit) => {
-                  if (Exit.isFailure(exit)) return Scope.close(childScope, exit)
-                  return Effect.void
-                })
-              )
+        Scope.fork(parentScope).pipe(
+          Effect.tap((childScope) => {
+            if (foreground) return Effect.void
+            return Scope.addFinalizer(childScope, releaseBackgroundSlot)
+          }),
+          Effect.flatMap((childScope) =>
+            restore(buildRuntime(entry, generation, foreground, childScope)).pipe(
+              Effect.onExit((exit) => {
+                if (Exit.isFailure(exit)) return Scope.close(childScope, exit)
+                return Effect.void
+              })
             )
           )
         )
@@ -727,12 +801,30 @@ const makeLayer = <D extends Definition.Any, R,>(
             entry.retryAttempt = 0
             entry.backgroundGeneration += 1
           }
+          if (entry.turnRunning) {
+            entry.turnDue = true
+            return Effect.void
+          }
           backgroundQueued.add(entry.spaceId)
-          return Queue.offer(backgroundQueue, { _tag: "Sync", spaceId: entry.spaceId }).pipe(Effect.asVoid)
+          return Queue.offer(backgroundQueue, entry.spaceId).pipe(Effect.asVoid)
+        })
+
+      const noteServerFailure = (entry: RememberedEntry) =>
+        Effect.map(Clock.currentTimeMillis, (now) => {
+          entry.serverFailures += 1
+          entry.retryNotBefore = now + Configuration.retryMillis(retryTiming, entry.serverFailures)
+        })
+
+      const awaitRetryAllowed = (entry: RememberedEntry) =>
+        Effect.flatMap(Clock.currentTimeMillis, (now) => {
+          if (now >= entry.retryNotBefore) return Effect.void
+          return Effect.sleep(Duration.millis(entry.retryNotBefore - now))
         })
 
       const forgetBackgroundFailure = (entry: RememberedEntry) =>
         Effect.suspend(() => {
+          entry.serverFailures = 0
+          entry.retryNotBefore = 0
           entry.backgroundGeneration += 1
           entry.backgroundFailure = undefined
           return FiberMap.remove(credentialWaits, entry.membershipIncarnation)
@@ -798,6 +890,19 @@ const makeLayer = <D extends Definition.Any, R,>(
         Clock.currentTimeMillis.pipe(
           Effect.flatMap((now) => settleBackgroundTurnAt(now, entry, generation, failure, transportGeneration))
         )
+
+      const retryStalledTurn = (entry: RememberedEntry) =>
+        Effect.flatMap(Clock.currentTimeMillis, (now) => {
+          if (entries.get(entry.spaceId) !== entry || entry.leaving || hasForegroundRuntime(entry)) return Effect.void
+          entry.retryAttempt += 1
+          entry.backgroundGeneration += 1
+          return Queue.offer(retryQueue, {
+            entry,
+            version: entry.backgroundGeneration,
+            readyAt: now + Configuration.retryMillis(retryTiming, entry.retryAttempt),
+            transportGeneration: Option.none()
+          }).pipe(Effect.asVoid)
+        })
 
       const releaseTransportRetries = Effect.gen(function*() {
         const current = yield* remote.transportGeneration
@@ -871,13 +976,39 @@ const makeLayer = <D extends Definition.Any, R,>(
           })
         )
 
-      const deactivate = (
+      const requestRetirement = (waiter: Waiter, runtime: ActiveRuntime | undefined) => {
+        if (waiter.retiring !== undefined) waiter.retiring.pendingRetirements -= 1
+        waiter.retiring = runtime
+        if (runtime === undefined) return
+        runtime.pendingRetirements += 1
+        runtime.requestedRetirements += 1
+      }
+
+      const withdrawRetirement = (waiter: Waiter) =>
+        Effect.suspend(() => {
+          if (waiter.retiring === undefined) return Effect.void
+          requestRetirement(waiter, undefined)
+          return signalCapacity
+        })
+
+      const awaitRetirementAfter = (runtime: ActiveRuntime, requested: number): Effect.Effect<void> =>
+        Effect.suspend(() => {
+          if (runtime.pendingRetirements > 0 || runtime.requestedRetirements > requested) return Effect.void
+          return Completion.wait(capacityChanged).pipe(Effect.andThen(awaitRetirementAfter(runtime, requested)))
+        })
+
+      const awaitRetirement = (runtime: ActiveRuntime) => awaitRetirementAfter(runtime, runtime.requestedRetirements)
+
+      const deactivating = Effect.fnUntraced(function*(
         entry: RememberedEntry,
         explicit: boolean,
-        expectedRuntime?: ActiveRuntime,
-        enqueuePending = true
-      ): Effect.Effect<boolean, ReplicaError.ReplicaError> =>
-        Effect.uninterruptibleMask(Effect.fnUntraced(function*(restore) {
+        expectedRuntime: ActiveRuntime | undefined,
+        enqueuePending: boolean,
+        waiter: Waiter,
+        restore: Restore
+      ): Effect.fn.Return<boolean, ReplicaError.ReplicaError> {
+        let runtime: ActiveRuntime
+        while (true) {
           if (entries.get(entry.spaceId) !== entry) {
             return yield* new ReplicaError.SpaceUnavailable({ spaceId: entry.spaceId })
           }
@@ -885,98 +1016,121 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (entry.activation === "Activating" || entry.activation === "Deactivating") {
             const pending = entry.transition
             if (pending !== undefined) yield* restore(Completion.wait(pending))
-            return yield* deactivate(entry, explicit, expectedRuntime, enqueuePending)
+            continue
           }
-          const runtime = entry.runtime
-          if (runtime === undefined) {
+          const current = entry.runtime
+          if (current === undefined) {
             entry.activation = "Inactive"
             return false
           }
           if (
             expectedRuntime !== undefined &&
-            (runtime !== expectedRuntime || runtime.foreground || entry.foreground)
+            (current !== expectedRuntime || current.foreground || entry.foreground)
           ) return false
-          if (entry.leases > 0) {
-            if (!explicit) return false
-            const changed = capacityChanged
-            yield* Deferred.succeed(runtime.preemption, undefined)
-            yield* restore(Completion.wait(changed))
-            return yield* deactivate(entry, explicit, expectedRuntime, enqueuePending)
+          if (entry.leases === 0) {
+            runtime = current
+            break
           }
-          const completion = Completion.make<void, ReplicaError.ReplicaError>()
-          entry.activation = "Deactivating"
-          entry.transition = completion
-          dropForegroundReservation(entry)
-          yield* signalCapacity
-          yield* invalidateActivation(entry.spaceId)
-          const shutdown = Scope.close(runtime.scope, Exit.void)
-          const result = yield* runtime.operationGate.withPermits(operationPermits)(shutdown).pipe(Effect.exit)
-          entry.runtime = undefined
-          entry.activation = "Inactive"
-          entry.transition = undefined
-          yield* invalidateActivation(entry.spaceId)
-          yield* Completion.settle(completion, result)
-          if (Exit.isFailure(result)) {
-            yield* result
-            return false
+          if (!explicit) return false
+          if (waiter.retiring !== current) {
+            requestRetirement(waiter, current)
+            yield* signalCapacity
+            continue
           }
-          const count = yield* lane.withStatement(pendingCount(entry.spaceId)).pipe(
-            Effect.catchTags({
-              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-              SchemaError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.StorageCorrupt({
-                    message: "Client membership row is corrupt",
-                    cause
-                  })
-                ),
-              NoSuchElementError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.StorageCorrupt({
-                    message: "Client membership row is missing",
-                    cause
-                  })
-                )
-            }),
-            Effect.tapCause(() => {
-              if (enqueuePending) return enqueueBackground(entry)
-              return Effect.void
-            })
+          yield* restore(Completion.wait(capacityChanged))
+        }
+        const completion = Completion.make<void, ReplicaError.ReplicaError>()
+        entry.activation = "Deactivating"
+        entry.transition = completion
+        dropForegroundReservation(entry)
+        yield* signalCapacity
+        yield* invalidateActivation(entry.spaceId)
+        const shutdown = Scope.close(runtime.scope, Exit.void)
+        const result = yield* runtime.operationGate.withPermits(operationPermits)(shutdown).pipe(Effect.exit)
+        entry.runtime = undefined
+        entry.activation = "Inactive"
+        entry.transition = undefined
+        yield* invalidateActivation(entry.spaceId)
+        yield* Completion.settle(completion, result)
+        if (Exit.isFailure(result)) {
+          yield* result
+          return false
+        }
+        const count = yield* lane.withStatement(pendingCount(entry.spaceId)).pipe(
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({
+                  message: "Client membership row is corrupt",
+                  cause
+                })
+              ),
+            NoSuchElementError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({
+                  message: "Client membership row is missing",
+                  cause
+                })
+              )
+          }),
+          Effect.tapCause(() => {
+            if (enqueuePending) return enqueueBackground(entry)
+            return Effect.void
+          })
+        )
+        let changed = false
+        if (entry.activation === "Inactive") {
+          changed = yield* applyContribution(entry, () => inactiveStatus(entry, count.count))
+        }
+        if (enqueuePending && count.count > 0) yield* enqueueBackground(entry)
+        yield* announceContribution(changed)
+        return true
+      })
+
+      const deactivate = (
+        entry: RememberedEntry,
+        explicit: boolean,
+        expectedRuntime?: ActiveRuntime,
+        enqueuePending = true
+      ): Effect.Effect<boolean, ReplicaError.ReplicaError> =>
+        Effect.uninterruptibleMask((restore) => {
+          const waiter: Waiter = { retiring: undefined }
+          return deactivating(entry, explicit, expectedRuntime, enqueuePending, waiter, restore).pipe(
+            Effect.onExit(() => withdrawRetirement(waiter))
           )
-          let changed = false
-          if (entry.activation === "Inactive") {
-            changed = yield* applyContribution(entry, () => inactiveStatus(entry, count.count))
-          }
-          if (enqueuePending && count.count > 0) yield* enqueueBackground(entry)
-          yield* announceContribution(changed)
-          return true
-        }))
+        })
 
       const hasForegroundRuntime = (entry: RememberedEntry) =>
         entry.activation === "Active" && entry.runtime !== undefined && entry.runtime.foreground
 
-      const ensureForegroundCapacity = (entry: RememberedEntry): Effect.Effect<void, ReplicaError.ReplicaError> =>
-        Effect.suspend(() => {
-          if (hasForegroundRuntime(entry)) return Effect.void
-          let admitted = 0
-          let victim: RememberedEntry | undefined
-          for (const candidate of foregroundResidents.values()) {
-            if (candidate === entry || !foregroundAdmitted.has(candidate.spaceId)) continue
-            admitted += 1
-            if (victim === undefined && candidate.activation === "Active" && candidate.leases === 0) {
-              victim = candidate
-            }
-          }
-          if (admitted < options.foregroundActiveSpaces) {
-            foregroundAdmitted.add(entry.spaceId)
-            return Effect.void
-          }
-          if (victim !== undefined) {
-            return deactivate(victim, false).pipe(Effect.andThen(ensureForegroundCapacity(entry)))
-          }
-          const changed = capacityChanged
-          return Completion.wait(changed).pipe(Effect.andThen(ensureForegroundCapacity(entry)))
-        })
+      const leadsForegroundQueue = (waiter: Waiter) => {
+        for (const head of foregroundQueue) return head === waiter
+        return false
+      }
+
+      const idleForegroundResident = () => {
+        for (const candidate of foregroundResidents.values()) {
+          if (hasForegroundRuntime(candidate) && candidate.leases === 0) return candidate
+        }
+        return undefined
+      }
+
+      const busyForegroundRuntime = (waiter: Waiter) => {
+        let busy: ActiveRuntime | undefined
+        for (const candidate of foregroundResidents.values()) {
+          const runtime = candidate.runtime
+          if (candidate.activation !== "Active" || runtime === undefined || !runtime.foreground) continue
+          if (runtime === waiter.retiring) return runtime
+          busy ??= runtime
+        }
+        return busy
+      }
+
+      const touchForegroundResident = (entry: RememberedEntry) => {
+        foregroundResidents.delete(entry.spaceId)
+        foregroundResidents.set(entry.spaceId, entry)
+      }
 
       const releaseForegroundReservation = (entry: RememberedEntry) =>
         Effect.suspend(() => {
@@ -988,11 +1142,17 @@ const makeLayer = <D extends Definition.Any, R,>(
           return signalCapacity.pipe(Effect.andThen(enqueueBackground(entry)))
         })
 
-      const transition = (
+      const transitioning = Effect.fnUntraced(function*(
         entry: RememberedEntry,
-        foreground: boolean
-      ): Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError> =>
-        Effect.uninterruptibleMask(Effect.fnUntraced(function*(restore) {
+        foreground: boolean,
+        leased: boolean,
+        buildsWithoutPendingWork: boolean,
+        waiter: Waiter,
+        restore: Restore
+      ): Effect.fn.Return<ActiveRuntime, ReplicaError.ReplicaError> {
+        let replaced: ActiveRuntime | undefined
+        while (true) {
+          const catchesUp = !buildsWithoutPendingWork && entry.summaryStatus.pending === 0
           if (entries.get(entry.spaceId) !== entry || entry.leaving) {
             const rejection = new ReplicaError.SpaceUnavailable({ spaceId: entry.spaceId })
             if (!foreground) {
@@ -1001,150 +1161,246 @@ const makeLayer = <D extends Definition.Any, R,>(
             }
             return yield* rejection
           }
-          if (foreground && !hasForegroundRuntime(entry)) {
-            entry.foreground = true
-            foregroundResidents.delete(entry.spaceId)
-            foregroundResidents.set(entry.spaceId, entry)
-            yield* restore(ensureForegroundCapacity(entry))
-          }
-          if (foreground) {
-            foregroundResidents.delete(entry.spaceId)
-            foregroundResidents.set(entry.spaceId, entry)
-          }
-          let retiring: ActiveRuntime | undefined
-          if (entry.activation === "Active" && entry.runtime !== undefined) {
-            if (!foreground || entry.runtime.foreground) return entry.runtime
-            if (entry.leases > 0) {
-              const changed = capacityChanged
-              yield* Deferred.succeed(entry.runtime.preemption, undefined)
-              yield* restore(Completion.wait(changed))
-              return yield* transition(entry, foreground)
+          const current = entry.runtime
+          if (
+            entry.activation === "Active" && current !== undefined &&
+            (!foreground || current.foreground || (leased && entry.leases > entry.callerLeases))
+          ) {
+            if (leased && current.pendingRetirements > 0) {
+              yield* restore(Completion.wait(capacityChanged))
+              continue
             }
-            retiring = entry.runtime
-          } else if (entry.activation === "Activating" || entry.activation === "Deactivating") {
+            if (catchesUp && !current.foreground && !catchUpAdmitted()) {
+              yield* restore(Completion.wait(capacityChanged))
+              continue
+            }
+            if (leased) entry.leases += 1
+            if (leased && foreground) entry.callerLeases += 1
+            if (foreground && current.foreground) touchForegroundResident(entry)
+            return current
+          }
+          if (foreground && !foregroundResidents.has(entry.spaceId)) {
+            entry.foreground = true
+            foregroundQueue.add(waiter)
+            if (!leadsForegroundQueue(waiter)) {
+              yield* restore(Completion.wait(capacityChanged))
+              continue
+            }
+            if (foregroundResidents.size < options.foregroundActiveSpaces) {
+              foregroundResidents.set(entry.spaceId, entry)
+              foregroundQueue.delete(waiter)
+              requestRetirement(waiter, undefined)
+              yield* signalCapacity
+              continue
+            }
+            const idle = idleForegroundResident()
+            if (idle !== undefined) {
+              yield* restore(deactivate(idle, false))
+              continue
+            }
+            const busy = busyForegroundRuntime(waiter)
+            if (busy !== undefined && busy !== waiter.retiring) {
+              requestRetirement(waiter, busy)
+              yield* signalCapacity
+              continue
+            }
+            yield* restore(Completion.wait(capacityChanged))
+            continue
+          }
+          if (foregroundQueue.delete(waiter)) {
+            yield* signalCapacity
+            continue
+          }
+          if (entry.activation === "Activating" || entry.activation === "Deactivating") {
             const pending = entry.transition
             if (pending !== undefined) yield* restore(Completion.wait(pending))
-            return yield* transition(entry, foreground)
+            continue
           }
-          if (foreground && !entry.foreground) return yield* transition(entry, foreground)
-          const completion = Completion.make<void, ReplicaError.ReplicaError>()
-          const generation = ++nextGeneration
-          entry.activation = "Activating"
-          entry.transition = completion
-          entry.runtime = undefined
-          yield* modifyContribution(entry, (current) => ({ _tag: "Connecting", pending: current.pending }))
-          yield* invalidateActivation(entry.spaceId)
-          const startRuntime = restore(initialize(entry, generation, foreground))
-          let start = startRuntime
-          if (retiring !== undefined) {
-            start = retiring.operationGate.withPermits(operationPermits)(Scope.close(retiring.scope, Exit.void)).pipe(
-              Effect.andThen(restore(
-                lane.withStatement(pendingCount(entry.spaceId)).pipe(
-                  Effect.catchTags({
-                    SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-                    SchemaError: (cause) =>
-                      Effect.fail(
-                        new ReplicaError.StorageCorrupt({
-                          message: "Client membership row is corrupt",
-                          cause
-                        })
-                      ),
-                    NoSuchElementError: (cause) =>
-                      Effect.fail(
-                        new ReplicaError.StorageCorrupt({
-                          message: "Client membership row is missing",
-                          cause
-                        })
-                      )
-                  }),
-                  Effect.flatMap((count) =>
-                    modifyContribution(entry, () => ({ _tag: "Connecting", pending: count.count }))
-                  )
+          if (entry.activation === "Active" && current !== undefined) {
+            if (entry.leases === 0) {
+              replaced = current
+              break
+            }
+            if (waiter.retiring !== current) {
+              requestRetirement(waiter, current)
+              yield* signalCapacity
+              continue
+            }
+            yield* restore(Completion.wait(capacityChanged))
+            continue
+          }
+          const full = backgroundRuntimes === backgroundRuntimeLimit
+          if (catchesUp && (full || !catchUpAdmitted())) {
+            yield* restore(Completion.wait(capacityChanged))
+            continue
+          }
+          if (!foreground && full) {
+            slotWaiters.add(waiter)
+            const released = capacityChanged
+            yield* yieldCatchUps
+            yield* restore(Completion.wait(released))
+            continue
+          }
+          break
+        }
+        slotWaiters.delete(waiter)
+        if (!foreground) backgroundRuntimes += 1
+        const completion = Completion.make<void, ReplicaError.ReplicaError>()
+        const generation = ++nextGeneration
+        entry.activation = "Activating"
+        entry.transition = completion
+        entry.runtime = undefined
+        yield* modifyContribution(entry, (current) => ({ _tag: "Connecting", pending: current.pending }))
+        yield* invalidateActivation(entry.spaceId)
+        const startRuntime = initialize(entry, generation, foreground, restore)
+        let start = startRuntime
+        if (replaced !== undefined) {
+          start = replaced.operationGate.withPermits(operationPermits)(Scope.close(replaced.scope, Exit.void)).pipe(
+            Effect.andThen(restore(
+              lane.withStatement(pendingCount(entry.spaceId)).pipe(
+                Effect.catchTags({
+                  SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                  SchemaError: (cause) =>
+                    Effect.fail(
+                      new ReplicaError.StorageCorrupt({
+                        message: "Client membership row is corrupt",
+                        cause
+                      })
+                    ),
+                  NoSuchElementError: (cause) =>
+                    Effect.fail(
+                      new ReplicaError.StorageCorrupt({
+                        message: "Client membership row is missing",
+                        cause
+                      })
+                    )
+                }),
+                Effect.flatMap((count) =>
+                  modifyContribution(entry, () => ({ _tag: "Connecting", pending: count.count }))
                 )
-              )),
-              Effect.andThen(startRuntime)
-            )
-          }
-          const result = yield* start.pipe(Effect.exit)
-          if (Exit.isSuccess(result)) {
-            entry.runtime = result.value
-            entry.activation = "Active"
-            entry.transition = undefined
-            if (foreground) entry.backgroundGeneration += 1
-            yield* signalCapacity
-            yield* invalidateActivation(entry.spaceId)
-            yield* Completion.settle(completion, Exit.void)
-            return result.value
-          }
-          entry.activation = "Inactive"
+              )
+            )),
+            Effect.andThen(startRuntime)
+          )
+        }
+        const result = yield* start.pipe(Effect.exit)
+        if (Exit.isSuccess(result)) {
+          entry.runtime = result.value
+          entry.activation = "Active"
           entry.transition = undefined
-          dropForegroundReservation(entry)
-          const changed = yield* applyContribution(entry, (current) => inactiveStatus(entry, current.pending))
-          if (retiring !== undefined) yield* enqueueBackground(entry)
+          if (leased) entry.leases += 1
+          if (leased && foreground) entry.callerLeases += 1
+          if (foreground) {
+            entry.backgroundGeneration += 1
+            entry.serverFailures = 0
+            entry.retryNotBefore = 0
+          }
           yield* signalCapacity
-          yield* announceContribution(changed)
           yield* invalidateActivation(entry.spaceId)
-          if (Exit.hasInterrupts(result)) yield* Completion.settle(completion, Exit.void)
-          else yield* Completion.settle(completion, Exit.asVoid(result))
-          return yield* result
-        }))
+          yield* Completion.settle(completion, Exit.void)
+          return result.value
+        }
+        entry.activation = "Inactive"
+        entry.transition = undefined
+        dropForegroundReservation(entry)
+        const changed = yield* applyContribution(entry, (current) => inactiveStatus(entry, current.pending))
+        if (replaced !== undefined) yield* enqueueBackground(entry)
+        yield* signalCapacity
+        yield* announceContribution(changed)
+        yield* invalidateActivation(entry.spaceId)
+        if (Exit.hasInterrupts(result)) yield* Completion.settle(completion, Exit.void)
+        else yield* Completion.settle(completion, Exit.asVoid(result))
+        return yield* result
+      })
+
+      const transition = (
+        entry: RememberedEntry,
+        foreground: boolean,
+        leased: boolean,
+        buildsWithoutPendingWork: boolean,
+        waiter: Waiter,
+        restore: Restore
+      ): Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError> =>
+        transitioning(entry, foreground, leased, buildsWithoutPendingWork, waiter, restore).pipe(
+          Effect.onExit(() =>
+            Effect.suspend(() => {
+              if (slotWaiters.delete(waiter)) return signalCapacity
+              return Effect.void
+            })
+          )
+        )
 
       const activate = (
         entry: RememberedEntry,
-        foreground: boolean
-      ): Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError> => {
-        if (!foreground) return transition(entry, false)
-        return Effect.uninterruptibleMask((restore) => {
+        foreground: boolean,
+        leased: boolean,
+        restore: Restore
+      ): Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError> =>
+        Effect.suspend(() => {
+          const waiter: Waiter = { retiring: undefined }
+          if (!foreground) return transition(entry, false, leased, true, waiter, restore)
           entry.foregroundDemand += 1
-          return restore(transition(entry, true)).pipe(
-            Effect.onExit((exit) => {
+          return transition(entry, true, leased, true, waiter, restore).pipe(
+            Effect.onExit(() => {
               entry.foregroundDemand -= 1
+              const waited = foregroundQueue.delete(waiter) || waiter.retiring !== undefined
+              requestRetirement(waiter, undefined)
               if (
-                Exit.isSuccess(exit) ||
-                entry.foregroundDemand > 0 ||
-                !entry.foreground ||
-                hasForegroundRuntime(entry)
-              ) return Effect.void
-              return releaseForegroundReservation(entry)
+                entry.foregroundDemand === 0 &&
+                entry.foreground &&
+                !hasForegroundRuntime(entry)
+              ) return releaseForegroundReservation(entry)
+              if (waited) return signalCapacity
+              return Effect.void
             })
           )
         })
-      }
 
-      const acquire = (
-        entry: RememberedEntry,
-        foreground: boolean,
-        restore: (
-          effect: Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError>
-        ) => Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError>
-      ): Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError> =>
-        restore(activate(entry, foreground)).pipe(
-          Effect.flatMap((runtime) => {
-            if (entry.activation !== "Active" || entry.runtime !== runtime) return acquire(entry, foreground, restore)
-            entry.leases += 1
-            if (foreground) {
-              foregroundResidents.delete(entry.spaceId)
-              foregroundResidents.set(entry.spaceId, entry)
-            }
-            return Effect.succeed(runtime)
-          })
-        )
+      const activateForeground = (entry: RememberedEntry) =>
+        Effect.uninterruptibleMask((restore) => activate(entry, true, false, restore))
 
-      const release = (entry: RememberedEntry) =>
-        Effect.sync(() => {
+      const release = (entry: RememberedEntry, holder: "Caller" | "BackgroundTurn" | "WorkflowAttempt") =>
+        Effect.suspend(() => {
           entry.leases = Math.max(0, entry.leases - 1)
-        }).pipe(Effect.andThen(signalCapacity))
+          const runtime = entry.runtime
+          const background = entry.activation === "Active" && runtime !== undefined && !runtime.foreground
+          if (holder === "Caller") entry.callerLeases = Math.max(0, entry.callerLeases - 1)
+          if (holder === "BackgroundTurn" || entry.leases > 0 || !background || runtime === undefined) {
+            return signalCapacity
+          }
+          return closeReleasedRuntime(entry, runtime).pipe(
+            Effect.provideService(ConnectionLane.Priority, "Background"),
+            Effect.forkIn(parentScope),
+            Effect.andThen(signalCapacity)
+          )
+        })
+
+      const callersReleased = (entry: RememberedEntry): Effect.Effect<void> =>
+        Effect.suspend(() => {
+          if (entry.callerLeases === 0) return Effect.void
+          return Completion.wait(capacityChanged).pipe(Effect.andThen(callersReleased(entry)))
+        })
+
+      const endedByRetirement = <A, E extends { readonly _tag: string },>(
+        runtime: ActiveRuntime,
+        turn: Effect.Effect<A, E>
+      ): Effect.Effect<Option.Option<A>, E> => {
+        const retired = Effect.as(awaitRetirement(runtime), Option.none<A>())
+        return turn.pipe(Effect.map(Option.some), Effect.raceFirst(retired))
+      }
 
       const withLease = <A, E extends { readonly _tag: string },>(
         entry: RememberedEntry,
         foreground: boolean,
         use: (runtime: ActiveRuntime) => Effect.Effect<A, E>
       ): Effect.Effect<A, E | ReplicaError.ReplicaError> =>
-        Effect.uninterruptibleMask((restore) =>
-          acquire(entry, foreground, restore).pipe(
-            Effect.flatMap((runtime) => restore(use(runtime)).pipe(Effect.ensuring(release(entry))))
+        Effect.uninterruptibleMask((restore) => {
+          let holder: "Caller" | "BackgroundTurn" = "BackgroundTurn"
+          if (foreground) holder = "Caller"
+          return activate(entry, foreground, true, restore).pipe(
+            Effect.flatMap((runtime) => restore(use(runtime)).pipe(Effect.ensuring(release(entry, holder))))
           )
-        )
+        })
 
       const withActive = <A, E extends { readonly _tag: string },>(
         entry: RememberedEntry,
@@ -1206,18 +1462,51 @@ const makeLayer = <D extends Definition.Any, R,>(
           )
         )
 
+      const syncWhileLeased = (entry: RememberedEntry): Effect.Effect<void, ReplicaError.ReplicaError> =>
+        withActive(entry, (runtime) => endedByRetirement(runtime, runtime.reconciler.sync)).pipe(
+          Effect.flatMap(Option.match({
+            onNone: () => Effect.andThen(awaitRetryAllowed(entry), syncWhileLeased(entry)),
+            onSome: () => Effect.void
+          }))
+        )
+
+      const discardAnswered = (request: Protocol.DiscardRequest) =>
+        remote.credentialGeneration.pipe(
+          Effect.flatMap((generation) => answeredUnderCredential(remote, generation, remote.discard(request)))
+        )
+
+      const discardUnderOneCredential = (
+        request: Protocol.DiscardRequest
+      ): Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError> =>
+        discardAnswered(request).pipe(
+          Effect.flatMap(Option.match({
+            onNone: () => discardAnswered(request),
+            onSome: (receipt) => Effect.succeed(Option.some(receipt))
+          })),
+          Effect.flatMap(Option.match({
+            onNone: () =>
+              Effect.fail(
+                new ReplicaError.UnexpectedFailure({
+                  message: "The credential generation changed again while the discard was sent again",
+                  cause: { mutationId: request.envelope.mutationId }
+                })
+              ),
+            onSome: Effect.succeed
+          }))
+        )
+
       const continueCancellation = Effect.fnUntraced(function*(
-        runtime: ActiveRuntime,
+        entry: RememberedEntry,
         initial: Option.Option<Quarantine.QuarantinedMutation>
       ) {
         let canceled = initial
         while (Option.isSome(canceled)) {
-          yield* runtime.reconciler.sync
-          const canceledReceipt = yield* remote.discard({
+          yield* syncWhileLeased(entry)
+          const canceledReceipt = yield* discardUnderOneCredential({
             envelope: canceled.value.envelope,
-            schema: runtime.local.schema
+            schema: options.definition.schemaIdentity
           })
-          canceled = yield* runtime.local.resolveQuarantine(canceledReceipt, "Discard")
+          canceled = yield* withActive(entry, (runtime) => runtime.local.resolveQuarantine(canceledReceipt, "Discard"))
         }
       })
 
@@ -1225,6 +1514,26 @@ const makeLayer = <D extends Definition.Any, R,>(
         runtime.local.pendingCount.pipe(
           Effect.flatMap((pending) => applyPendingContribution(entry, pending)),
           Effect.flatMap((changed) => Effect.ensuring(runtime.reconciler.notify, announceContribution(changed)))
+        )
+
+      const recountAfterQuarantine = <A, E extends { readonly _tag: string },>(
+        entry: RememberedEntry,
+        exit: Exit.Exit<A, E>
+      ): Effect.Effect<A, E> =>
+        withActive(entry, (runtime) => recountPending(entry, runtime)).pipe(
+          Effect.catchTag("SpaceUnavailable", () => Effect.void),
+          Effect.catch((error) =>
+            Effect.logError("Pending recount after a quarantine operation failed", error).pipe(
+              Effect.annotateLogs({ "space.id": entry.spaceId })
+            )
+          ),
+          Effect.matchCauseEffect({
+            onSuccess: () => exit,
+            onFailure: (cause): Effect.Effect<A, E> => {
+              if (Exit.isSuccess(exit)) return Effect.failCause(cause)
+              return Effect.failCause(Cause.combine(exit.cause, cause))
+            }
+          })
         )
 
       const findReceipt = (runtime: ActiveRuntime, mutationId: Identity.MutationId) =>
@@ -1252,7 +1561,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           setScope: (nextScope) =>
             withActive(entry, (runtime) => runtime.local.setScope(nextScope)).pipe(
               Effect.flatMap(() => deactivate(entry, true)),
-              Effect.andThen(activate(entry, true)),
+              Effect.andThen(activateForeground(entry)),
               Effect.flatMap((runtime) => runtime.reconciler.notify),
               Effect.andThen(notify([ReactivityKey.scope(entry.spaceId)])),
               onCallerFiber
@@ -1263,7 +1572,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             }
             return Effect.succeed(entry.activation)
           }),
-          activate: activate(entry, true).pipe(Effect.asVoid, onCallerFiber),
+          activate: activateForeground(entry).pipe(Effect.asVoid, onCallerFiber),
           deactivate: deactivate(entry, true).pipe(Effect.asVoid, onCallerFiber),
           mutate: (mutation, payload, mutateOptions) =>
             withActive(entry, (runtime) => runtime.local.mutate(mutation, payload, mutateOptions)),
@@ -1299,61 +1608,74 @@ const makeLayer = <D extends Definition.Any, R,>(
             withActive(entry, (runtime) => runtime.local.acknowledgeSettlements(sequence)),
           quarantine: withActive(entry, (runtime) => runtime.local.quarantine),
           discardQuarantined: (mutationId) =>
-            withActive(entry, (runtime) =>
-              runtime.quarantineGate.withPermit(
-                Effect.fnUntraced(function*() {
-                  const found = yield* runtime.local.quarantineByMutation(mutationId)
-                  if (Option.isNone(found)) {
-                    const continuation = yield* runtime.local.quarantineCancellation(mutationId)
-                    yield* continueCancellation(runtime, continuation)
-                    return yield* findReceipt(runtime, mutationId)
-                  }
-                  const receipt = yield* remote.discard({
-                    envelope: found.value.envelope,
-                    schema: runtime.local.schema
-                  })
-                  const canceled = yield* runtime.local.resolveQuarantine(receipt, "Discard")
-                  yield* continueCancellation(runtime, canceled)
-                  return receipt
-                })()
-              ).pipe(
-                Effect.exit,
-                Effect.flatMap((exit) => Effect.andThen(recountPending(entry, runtime), exit))
-              )),
+            entry.quarantineGate.withPermit(Effect.gen(function*() {
+              const found = yield* withActive(entry, (runtime) => runtime.local.quarantineByMutation(mutationId))
+              if (Option.isNone(found)) {
+                const continuation = yield* withActive(
+                  entry,
+                  (runtime) => runtime.local.quarantineCancellation(mutationId)
+                )
+                yield* continueCancellation(entry, continuation)
+                return yield* withActive(entry, (runtime) => findReceipt(runtime, mutationId))
+              }
+              const receipt = yield* discardUnderOneCredential({
+                envelope: found.value.envelope,
+                schema: options.definition.schemaIdentity
+              })
+              const canceled = yield* withActive(
+                entry,
+                (runtime) => runtime.local.resolveQuarantine(receipt, "Discard")
+              )
+              yield* continueCancellation(entry, canceled)
+              return receipt
+            })).pipe(
+              Effect.exit,
+              Effect.flatMap((exit) => recountAfterQuarantine(entry, exit))
+            ),
           resubmitQuarantined: <M extends Mutation.Any,>(
             mutationId: Identity.MutationId,
             mutation: M,
             payload: Mutation.Payload<M>
           ) =>
-            withActive(entry, (runtime) =>
-              runtime.quarantineGate.withPermit(
-                Effect.fnUntraced(function*() {
-                  yield* MutationDescriptor.validate(options.definition, mutation)
-                  const found = yield* runtime.local.quarantineByMutation(mutationId)
-                  if (Option.isNone(found)) {
-                    const continuation = yield* runtime.local.quarantineCancellation(mutationId)
-                    yield* continueCancellation(runtime, continuation)
-                    return Quarantine.AlreadyResolved.make({ receipt: yield* findReceipt(runtime, mutationId) })
-                  }
-                  const item = found.value
-                  if (mutation.name !== item.envelope.name) {
-                    return yield* new ReplicaError.ProtocolInvalid({
-                      message: `Resubmission mutation ${mutation.name} does not match ${item.envelope.name}`
-                    })
-                  }
-                  const pending = yield* runtime.local.ensureQuarantineResubmission(mutationId, mutation, payload)
-                  const receipt = yield* remote.discard({ envelope: item.envelope, schema: runtime.local.schema })
-                  const canceled = yield* runtime.local.resolveQuarantine(receipt, "Resubmit")
-                  yield* continueCancellation(runtime, canceled)
-                  if (receipt._tag !== "Rejected" || receipt.origin !== "Quarantine") {
-                    return Quarantine.AlreadyResolved.make({ receipt })
-                  }
-                  return Quarantine.Resubmitted.make({ pending })
-                })()
-              ).pipe(
-                Effect.exit,
-                Effect.flatMap((exit) => Effect.andThen(recountPending(entry, runtime), exit))
-              )),
+            entry.quarantineGate.withPermit(Effect.gen(function*() {
+              yield* MutationDescriptor.validate(options.definition, mutation)
+              const found = yield* withActive(entry, (runtime) => runtime.local.quarantineByMutation(mutationId))
+              if (Option.isNone(found)) {
+                const continuation = yield* withActive(
+                  entry,
+                  (runtime) => runtime.local.quarantineCancellation(mutationId)
+                )
+                yield* continueCancellation(entry, continuation)
+                const resolved = yield* withActive(entry, (runtime) => findReceipt(runtime, mutationId))
+                return Quarantine.AlreadyResolved.make({ receipt: resolved })
+              }
+              const item = found.value
+              if (mutation.name !== item.envelope.name) {
+                return yield* new ReplicaError.ProtocolInvalid({
+                  message: `Resubmission mutation ${mutation.name} does not match ${item.envelope.name}`
+                })
+              }
+              const pending = yield* withActive(
+                entry,
+                (runtime) => runtime.local.ensureQuarantineResubmission(mutationId, mutation, payload)
+              )
+              const receipt = yield* discardUnderOneCredential({
+                envelope: item.envelope,
+                schema: options.definition.schemaIdentity
+              })
+              const canceled = yield* withActive(
+                entry,
+                (runtime) => runtime.local.resolveQuarantine(receipt, "Resubmit")
+              )
+              yield* continueCancellation(entry, canceled)
+              if (receipt._tag !== "Rejected" || receipt.origin !== "Quarantine") {
+                return Quarantine.AlreadyResolved.make({ receipt })
+              }
+              return Quarantine.Resubmitted.make({ pending })
+            })).pipe(
+              Effect.exit,
+              Effect.flatMap((exit) => recountAfterQuarantine(entry, exit))
+            ),
           status: Effect.suspend(() => {
             const runtime = entry.runtime
             if (entry.activation === "Active" && runtime !== undefined) {
@@ -1393,9 +1715,23 @@ const makeLayer = <D extends Definition.Any, R,>(
       const createEntry = Effect.fnUntraced(function*(row: typeof RememberedRow.Type) {
         yield* decodeScope(row.desired_scope_json)
         let handle: Replica.Space | undefined
+        const answered = <A,>(
+          call: Effect.Effect<A, ReplicaError.ReplicaError>
+        ): Effect.Effect<A, ReplicaError.ReplicaError> =>
+          Effect.uninterruptibleMask((restore) =>
+            restore(call).pipe(
+              Effect.result,
+              Effect.flatMap((result): Effect.Effect<A, ReplicaError.ReplicaError> => {
+                if (Result.isSuccess(result)) return Effect.succeed(result.success)
+                if (!Reconciler.isTransientFailure(result.failure)) return Effect.fail(result.failure)
+                return Effect.andThen(noteServerFailure(entry), Effect.fail(result.failure))
+              })
+            )
+          )
         const entry: RememberedEntry = {
           spaceId: row.space_id,
           membershipIncarnation: row.membership_incarnation,
+          quarantineGate: yield* Semaphore.make(1),
           get handle() {
             if (handle === undefined) handle = makeHandle(entry)
             return handle
@@ -1405,6 +1741,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           transition: undefined,
           foreground: false,
           foregroundDemand: 0,
+          callerLeases: 0,
           settlementsRecorded: Completion.make<void>(),
           leases: 0,
           leaving: false,
@@ -1414,36 +1751,49 @@ const makeLayer = <D extends Definition.Any, R,>(
           summaryStatus: { _tag: "Idle", pending: row.count },
           synced: row.replication_view_id !== null,
           retryAttempt: 0,
+          remote: SyncEngine.SyncEngine.of({
+            ...remote,
+            pull: (request) => answered(remote.pull(request)),
+            submitBatch: (request) => answered(remote.submitBatch(request)),
+            bootstrap: (request) => answered(remote.bootstrap(request))
+          }),
+          serverFailures: 0,
+          retryNotBefore: 0,
+          turnRetired: false,
+          turnRunning: false,
+          turnDue: false,
           backgroundGeneration: 0,
           backgroundFailure: undefined
         }
         if (workflow !== undefined) {
-          const lease = ReconciliationWorkflow.RuntimeLease.of({
-            acquire: Effect.gen(function*() {
-              const foreground = entry.foreground
-              const leaseRuntime = yield* Effect.uninterruptibleMask((restore) =>
-                acquire(entry, foreground, restore).pipe(
-                  Effect.tap((runtime) =>
-                    Effect.addFinalizer(() =>
-                      release(entry).pipe(
-                        Effect.andThen(Queue.offer(backgroundQueue, { _tag: "Deactivate", entry, runtime })),
-                        Effect.asVoid
-                      )
-                    )
-                  )
-                )
+          const leaseRuntime = (need: ReconciliationWorkflow.RuntimeNeed) =>
+            Effect.uninterruptibleMask((restore) =>
+              transition(entry, false, true, need === "Always", { retiring: undefined }, restore).pipe(
+                Effect.tap(() => Effect.addFinalizer(() => release(entry, "WorkflowAttempt")))
               )
-              return {
-                local: leaseRuntime.local,
-                reconciliation: leaseRuntime.reconciliation
-              }
-            }),
-            admit: (effect) =>
-              Effect.suspend(() => {
-                let turns = backgroundWorkflowTurns
-                if (entry.foreground) turns = foregroundWorkflowTurns
-                return turns.withPermit(effect)
+            )
+          const leasedAttempt = <A,>(
+            execute: (runtime: ReconciliationWorkflow.RuntimeServices) => Effect.Effect<A, ReplicaError.ReplicaError>,
+            need: ReconciliationWorkflow.RuntimeNeed
+          ): Effect.Effect<A, ReplicaError.ReplicaError> =>
+            Effect.andThen(awaitRetryAllowed(entry), leaseRuntime(need)).pipe(
+              Effect.flatMap((runtime) => {
+                let turn = withAttemptTurn(runtime, execute(runtime)).pipe(Effect.map(Option.some))
+                if (need === "WhenThereIsPendingWork" && !runtime.foreground && entry.summaryStatus.pending === 0) {
+                  turn = withCatchUpTurn(runtime, execute(runtime))
+                }
+                return endedByRetirement(runtime, turn)
+              }),
+              Effect.scoped,
+              Effect.flatMap((ended) => {
+                const done = Option.flatten(ended)
+                if (Option.isNone(done)) return leasedAttempt(execute, need)
+                return Effect.succeed(done.value)
               })
+            )
+          const lease = ReconciliationWorkflow.RuntimeLease.of({
+            acquire: leaseRuntime("Always"),
+            attempt: leasedAttempt
           })
           const registrationContext = Context.add(
             Context.add(rootContext, WorkflowEngine.WorkflowEngine, workflow),
@@ -1563,6 +1913,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           current.leaving = true
           current.leaveCompletion = completion
           const cleanup = Effect.suspend(() => current.runtime?.cancelReconciliation ?? Effect.void).pipe(
+            Effect.andThen(current.workflowRegistration?.cancelExecution ?? Effect.void),
             Effect.andThen(deactivate(current, true)),
             Effect.andThen(
               lane.withTransaction(
@@ -1619,37 +1970,42 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const status = Ref.get(aggregate)
 
-      const runBackgroundWork = Effect.fnUntraced(function*(
-        work: BackgroundWork,
-        entry: RememberedEntry,
-        generation: number
-      ) {
-        if (work._tag === "Deactivate") {
-          const result = yield* deactivate(entry, false, work.runtime, false).pipe(Effect.result)
-          if (Result.isFailure(result)) {
-            yield* settleBackgroundTurn(entry, generation, result.failure, Option.none())
-          }
-          return
-        }
+      const freeForPromotion = (entry: RememberedEntry) =>
+        entries.get(entry.spaceId) === entry && !entry.leaving && entry.activation === "Active" &&
+        entry.runtime !== undefined && !entry.runtime.foreground
+
+      const runBackgroundTurn = Effect.fnUntraced(function*(entry: RememberedEntry, generation: number) {
         if (entry.leaving) {
           entry.dueWhileLeaving = true
           return
         }
+        if (entry.turnRetired) {
+          entry.turnRetired = false
+          yield* awaitRetryAllowed(entry)
+        }
         let activeRuntime: ActiveRuntime | undefined
         const transportGeneration = yield* remote.transportGeneration
+        const pendingBefore = entry.summaryStatus.pending
         const result = yield* withLease(entry, false, (runtime) => {
           activeRuntime = runtime
           let sync = runtime.reconciler.sync
-          if (workflow !== undefined) sync = backgroundWorkflowTurns.withPermit(sync)
-          return Effect.raceFirst(sync, Deferred.await(runtime.preemption))
+          if (workflow !== undefined) sync = withWorkflowTurn(runtime, sync)
+          return endedByRetirement(runtime, sync)
         }).pipe(Effect.result)
+        entry.turnRetired = Result.isSuccess(result) && Option.isNone(result.success)
+        const stalled = Result.isSuccess(result) && Option.isSome(result.success) &&
+          entry.summaryStatus.pending > 0 && entry.summaryStatus.pending === pendingBefore
         if (activeRuntime !== undefined) {
-          const deactivation = yield* deactivate(
+          const usedByCallers = entry.callerLeases > 0
+          yield* callersReleased(entry)
+          let closing: Effect.Effect<unknown, ReplicaError.ReplicaError> = deactivate(
             entry,
             false,
             activeRuntime,
-            Result.isSuccess(result)
-          ).pipe(Effect.result)
+            Result.isSuccess(result) && !stalled
+          )
+          if (usedByCallers && freeForPromotion(entry)) closing = activateForeground(entry)
+          const deactivation = yield* Effect.result(closing)
           if (Result.isFailure(deactivation)) {
             yield* settleBackgroundTurn(entry, generation, deactivation.failure, Option.none())
             return
@@ -1658,6 +2014,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         if (Result.isFailure(result) && !leaveRejections.has(result.failure)) {
           yield* settleBackgroundTurn(entry, generation, result.failure, Option.some(transportGeneration))
         }
+        if (stalled) yield* retryStalledTurn(entry)
       })
 
       const settleDiedTurn = Effect.fnUntraced(function*(
@@ -1685,29 +2042,44 @@ const makeLayer = <D extends Definition.Any, R,>(
         )
       })
 
-      const backgroundTurn = Effect.gen(function*() {
-        const work = yield* LosslessQueue.take(backgroundQueue)
-        let entry: RememberedEntry | undefined
-        if (work._tag === "Deactivate") {
-          entry = work.entry
-        } else {
-          backgroundQueued.delete(work.spaceId)
-          entry = entries.get(work.spaceId)
-        }
-        if (entry === undefined) return
-        const claimed = entry
-        const generation = claimed.backgroundGeneration
-        yield* runBackgroundWork(work, claimed, generation).pipe(
-          Effect.catchCause((cause) =>
-            settleDiedTurn(claimed, generation, cause).pipe(
-              Effect.catchCause((settleCause) =>
-                Errors.logDefect("Background turn settlement died", settleCause).pipe(
-                  Effect.annotateLogs({ "space.id": claimed.spaceId })
+      const settledBackgroundWork = (entry: RememberedEntry, work: (generation: number) => Effect.Effect<void>) =>
+        Effect.suspend(() => {
+          const generation = entry.backgroundGeneration
+          return work(generation).pipe(
+            Effect.catchCause((cause) =>
+              settleDiedTurn(entry, generation, cause).pipe(
+                Effect.catchCause((settleCause) =>
+                  Errors.logDefect("Background turn settlement died", settleCause).pipe(
+                    Effect.annotateLogs({ "space.id": entry.spaceId })
+                  )
                 )
               )
             )
           )
-        )
+        })
+
+      const closeReleasedRuntime = (entry: RememberedEntry, runtime: ActiveRuntime) =>
+        settledBackgroundWork(entry, (generation) =>
+          deactivate(entry, false, runtime, false).pipe(
+            Effect.asVoid,
+            Effect.catch((failure) => settleBackgroundTurn(entry, generation, failure, Option.none()))
+          ))
+
+      const backgroundTurn = Effect.gen(function*() {
+        const spaceId = yield* LosslessQueue.take(backgroundQueue)
+        backgroundQueued.delete(spaceId)
+        yield* wantBackgroundTurn
+        const entry = entries.get(spaceId)
+        if (entry !== undefined) {
+          entry.turnRunning = true
+          yield* settledBackgroundWork(entry, (generation) => runBackgroundTurn(entry, generation))
+          entry.turnRunning = false
+          const due = entry.turnDue
+          entry.turnDue = false
+          if (due && !hasForegroundRuntime(entry)) yield* enqueueBackground(entry, false)
+        }
+        backgroundTurnsWanted -= 1
+        yield* signalCapacity
       })
 
       yield* Effect.forEach(

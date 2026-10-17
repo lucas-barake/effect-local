@@ -2,7 +2,11 @@ import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
+import * as FiberMap from "effect/FiberMap"
+import * as Option from "effect/Option"
+import * as Result from "effect/Result"
 import type * as SyncEngine from "../SyncEngine.js"
+import * as Configuration from "./configuration.js"
 import * as Errors from "./errors.js"
 
 export const isTransportFailure = (error: ReplicaError.ReplicaError) =>
@@ -36,6 +40,63 @@ export const credentialChange = (
   )
   return wait
 }
+
+export const answeredUnderCredential = <A,>(
+  remote: SyncEngine.Service,
+  generation: number,
+  call: Effect.Effect<A, ReplicaError.ReplicaError>
+): Effect.Effect<Option.Option<A>, ReplicaError.ReplicaError> =>
+  Effect.result(call).pipe(
+    Effect.zip(remote.credentialGeneration),
+    Effect.flatMap(([answer, current]): Effect.Effect<Option.Option<A>, ReplicaError.ReplicaError> => {
+      if (current !== generation) return Effect.succeed(Option.none())
+      if (Result.isFailure(answer)) return Effect.fail(answer.failure)
+      return Effect.succeed(Option.some(answer.success))
+    })
+  )
+
+export const makeRetryPosition = Effect.fnUntraced(function*(options: {
+  readonly timing: Configuration.RetryTiming
+  readonly pending: Effect.Effect<number>
+  readonly retry: Effect.Effect<void>
+}) {
+  const stalls = yield* FiberMap.make<"stalled", void, never>()
+  let attempt = 0
+  let stalledPending = 0
+  let stallTimed = false
+  const nextDelay = () => {
+    attempt += 1
+    return Configuration.retryMillis(options.timing, attempt)
+  }
+  const cancelStalledRetry = Effect.suspend(() => {
+    stallTimed = false
+    return FiberMap.remove(stalls, "stalled")
+  })
+  const retryUnfinished = Effect.gen(function*() {
+    const left = yield* options.pending
+    if (left === 0 || left < stalledPending) attempt = 0
+    stalledPending = left
+    if (left === 0) {
+      yield* cancelStalledRetry
+      return
+    }
+    if (stallTimed) return
+    stallTimed = true
+    const elapsed = Effect.sync(() => {
+      stallTimed = false
+    })
+    const retried = Effect.sleep(nextDelay()).pipe(Effect.andThen(elapsed), Effect.andThen(options.retry))
+    yield* FiberMap.run(stalls, "stalled", retried)
+  })
+  return {
+    nextDelay,
+    reset: () => {
+      attempt = 0
+    },
+    cancelStalledRetry,
+    retryUnfinished
+  }
+})
 
 export const superviseWatch = <R,>(options: {
   readonly spaceId: Identity.SpaceId
