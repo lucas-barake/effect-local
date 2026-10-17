@@ -340,10 +340,20 @@ const makeLayer = <D extends Definition.Any, R,>(
       )
       const backgroundRuntimeLimit = options.maximumActiveSpaces - options.foregroundActiveSpaces
       let backgroundRuntimes = 0
+      const slotWaiters = new Set<Waiter>()
       const foregroundWorkflowTurns = yield* Semaphore.make(foregroundReconciliationConcurrency)
-      const backgroundWorkflowTurns = yield* Semaphore.make(
-        reconciliationConcurrency - foregroundReconciliationConcurrency
-      )
+      const backgroundWorkflowTurnLimit = reconciliationConcurrency - foregroundReconciliationConcurrency
+      const backgroundWorkflowTurns = yield* Semaphore.make(backgroundWorkflowTurnLimit)
+      let backgroundTurnsWanted = 0
+      const catchUpTurns = new Set<Completion.Completion<void>>()
+      const yieldCatchUps = Effect.suspend(() => {
+        const yielding = Array.from(catchUpTurns)
+        catchUpTurns.clear()
+        return Effect.forEach(yielding, (yielded) => Completion.settle(yielded, Exit.void), { discard: true })
+      })
+      const catchUpAdmitted = () =>
+        slotWaiters.size === 0 && backgroundQueued.size === 0 &&
+        backgroundTurnsWanted < backgroundWorkflowTurnLimit
       const withWorkflowTurn = <A, E extends { readonly _tag: string },>(
         runtime: ActiveRuntime,
         turn: Effect.Effect<A, E>
@@ -351,6 +361,52 @@ const makeLayer = <D extends Definition.Any, R,>(
         let turns = backgroundWorkflowTurns
         if (runtime.foreground) turns = foregroundWorkflowTurns
         return runtime.workflowTurn.withPermit(turns.withPermit(turn))
+      }
+      const wantBackgroundTurn = Effect.suspend(() => {
+        backgroundTurnsWanted += 1
+        if (backgroundTurnsWanted > backgroundWorkflowTurnLimit) return yieldCatchUps
+        return Effect.void
+      })
+      const giveBackBackgroundTurn = Effect.sync(() => {
+        backgroundTurnsWanted -= 1
+      })
+      const withAttemptTurn = <A, E extends { readonly _tag: string },>(
+        runtime: ActiveRuntime,
+        turn: Effect.Effect<A, E>
+      ): Effect.Effect<A, E> => {
+        if (runtime.foreground) return withWorkflowTurn(runtime, turn)
+        const permitted = backgroundWorkflowTurns.withPermit(turn)
+        const wanted = Effect.uninterruptibleMask((restore) =>
+          wantBackgroundTurn.pipe(
+            Effect.andThen(restore(permitted)),
+            Effect.ensuring(giveBackBackgroundTurn)
+          )
+        )
+        return runtime.workflowTurn.withPermit(wanted)
+      }
+      const withCatchUpTurn = <A, E extends { readonly _tag: string },>(
+        runtime: ActiveRuntime,
+        turn: Effect.Effect<A, E>
+      ): Effect.Effect<Option.Option<A>, E> => {
+        const admitted = Effect.uninterruptibleMask((restore) =>
+          Effect.suspend(() => {
+            if (!catchUpAdmitted()) return Effect.succeed(Option.none<A>())
+            const yielded = Completion.make<void>()
+            const yields = Completion.wait(yielded).pipe(Effect.as(Option.none<A>()))
+            backgroundTurnsWanted += 1
+            catchUpTurns.add(yielded)
+            return backgroundWorkflowTurns.withPermit(turn).pipe(
+              Effect.map(Option.some),
+              Effect.raceFirst(yields),
+              restore,
+              Effect.ensuring(Effect.sync(() => {
+                backgroundTurnsWanted -= 1
+                catchUpTurns.delete(yielded)
+              }))
+            )
+          })
+        )
+        return runtime.workflowTurn.withPermit(admitted)
       }
       const retryTiming = yield* Configuration.retryTiming(options)
       const backgroundQueue = yield* Effect.acquireRelease(
@@ -1086,7 +1142,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           return signalCapacity.pipe(Effect.andThen(enqueueBackground(entry)))
         })
 
-      const transition = Effect.fnUntraced(function*(
+      const transitioning = Effect.fnUntraced(function*(
         entry: RememberedEntry,
         foreground: boolean,
         leased: boolean,
@@ -1096,6 +1152,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       ): Effect.fn.Return<ActiveRuntime, ReplicaError.ReplicaError> {
         let replaced: ActiveRuntime | undefined
         while (true) {
+          const catchesUp = !buildsWithoutPendingWork && entry.summaryStatus.pending === 0
           if (entries.get(entry.spaceId) !== entry || entry.leaving) {
             const rejection = new ReplicaError.SpaceUnavailable({ spaceId: entry.spaceId })
             if (!foreground) {
@@ -1110,6 +1167,10 @@ const makeLayer = <D extends Definition.Any, R,>(
             (!foreground || current.foreground || (leased && entry.leases > entry.callerLeases))
           ) {
             if (leased && current.pendingRetirements > 0) {
+              yield* restore(Completion.wait(capacityChanged))
+              continue
+            }
+            if (catchesUp && !current.foreground && !catchUpAdmitted()) {
               yield* restore(Completion.wait(capacityChanged))
               continue
             }
@@ -1168,16 +1229,20 @@ const makeLayer = <D extends Definition.Any, R,>(
             yield* restore(Completion.wait(capacityChanged))
             continue
           }
-          if (!buildsWithoutPendingWork && entry.summaryStatus.pending === 0) {
+          const full = backgroundRuntimes === backgroundRuntimeLimit
+          if (catchesUp && (full || !catchUpAdmitted())) {
             yield* restore(Completion.wait(capacityChanged))
             continue
           }
-          if (!foreground && backgroundRuntimes === backgroundRuntimeLimit) {
+          if (!foreground && full) {
+            slotWaiters.add(waiter)
+            yield* yieldCatchUps
             yield* restore(Completion.wait(capacityChanged))
             continue
           }
           break
         }
+        slotWaiters.delete(waiter)
         if (!foreground) backgroundRuntimes += 1
         const completion = Completion.make<void, ReplicaError.ReplicaError>()
         const generation = ++nextGeneration
@@ -1246,6 +1311,23 @@ const makeLayer = <D extends Definition.Any, R,>(
         else yield* Completion.settle(completion, Exit.asVoid(result))
         return yield* result
       })
+
+      const transition = (
+        entry: RememberedEntry,
+        foreground: boolean,
+        leased: boolean,
+        buildsWithoutPendingWork: boolean,
+        waiter: Waiter,
+        restore: Restore
+      ): Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError> =>
+        transitioning(entry, foreground, leased, buildsWithoutPendingWork, waiter, restore).pipe(
+          Effect.onExit(() =>
+            Effect.suspend(() => {
+              if (slotWaiters.delete(waiter)) return signalCapacity
+              return Effect.void
+            })
+          )
+        )
 
       const activate = (
         entry: RememberedEntry,
@@ -1695,14 +1777,18 @@ const makeLayer = <D extends Definition.Any, R,>(
           ): Effect.Effect<A, ReplicaError.ReplicaError> =>
             Effect.andThen(awaitRetryAllowed(entry), leaseRuntime(need)).pipe(
               Effect.flatMap((runtime) => {
-                const turn = withWorkflowTurn(runtime, execute(runtime))
+                let turn = withAttemptTurn(runtime, execute(runtime)).pipe(Effect.map(Option.some))
+                if (need === "WhenThereIsPendingWork" && !runtime.foreground && entry.summaryStatus.pending === 0) {
+                  turn = withCatchUpTurn(runtime, execute(runtime))
+                }
                 return endedByRetirement(runtime, turn)
               }),
               Effect.scoped,
-              Effect.flatMap(Option.match({
-                onNone: () => leasedAttempt(execute, need),
-                onSome: Effect.succeed
-              }))
+              Effect.flatMap((ended) => {
+                const done = Option.flatten(ended)
+                if (Option.isNone(done)) return leasedAttempt(execute, need)
+                return Effect.succeed(done.value)
+              })
             )
           const lease = ReconciliationWorkflow.RuntimeLease.of({
             acquire: leaseRuntime("Always"),
@@ -1981,14 +2067,18 @@ const makeLayer = <D extends Definition.Any, R,>(
       const backgroundTurn = Effect.gen(function*() {
         const spaceId = yield* LosslessQueue.take(backgroundQueue)
         backgroundQueued.delete(spaceId)
+        yield* wantBackgroundTurn
         const entry = entries.get(spaceId)
-        if (entry === undefined) return
-        entry.turnRunning = true
-        yield* settledBackgroundWork(entry, (generation) => runBackgroundTurn(entry, generation))
-        entry.turnRunning = false
-        const due = entry.turnDue
-        entry.turnDue = false
-        if (due && !hasForegroundRuntime(entry)) yield* enqueueBackground(entry, false)
+        if (entry !== undefined) {
+          entry.turnRunning = true
+          yield* settledBackgroundWork(entry, (generation) => runBackgroundTurn(entry, generation))
+          entry.turnRunning = false
+          const due = entry.turnDue
+          entry.turnDue = false
+          if (due && !hasForegroundRuntime(entry)) yield* enqueueBackground(entry, false)
+        }
+        backgroundTurnsWanted -= 1
+        yield* signalCapacity
       })
 
       yield* Effect.forEach(

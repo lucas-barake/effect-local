@@ -36,12 +36,14 @@ const parkedAttempt = Effect.fnUntraced(function*() {
     constructor: "layerWorkflow",
     clientId,
     initialSpaces: [parked, other],
-    maximumActiveSpaces: 3,
+    maximumActiveSpaces: 2,
     foregroundActiveSpaces: 1,
     retryDelay: "1 second",
     maximumRetryDelay: "1 minute"
   })
+  yield* BackgroundReplica.seedPending(services, [other])
   const calling = yield* Deferred.make<void>()
+  const slotTaken = yield* Deferred.make<void>()
   let holding = true
   let pulls = 0
   const replicaScope = yield* Scope.make()
@@ -50,13 +52,13 @@ const parkedAttempt = Effect.fnUntraced(function*() {
     submitBatch: acceptSubmission,
     pull: (request) => {
       const page = emptyPage(services.crypto, request)
-      if (request.spaceId !== parked) return page
+      if (request.spaceId !== parked) return Deferred.succeed(slotTaken, undefined).pipe(Effect.andThen(Effect.never))
       pulls += 1
       if (!holding) return page
       return Deferred.succeed(calling, undefined).pipe(Effect.andThen(Effect.never))
     }
   })).pipe(Scope.provide(replicaScope))
-  yield* installView(services)
+  yield* VirtualTime.advanceUntil(Deferred.await(slotTaken))
   const space = yield* replica.space(parked)
   yield* VirtualTime.advanceUntil(space.activate)
   yield* VirtualTime.advanceUntil(Deferred.await(calling))
@@ -64,7 +66,7 @@ const parkedAttempt = Effect.fnUntraced(function*() {
   yield* quiet
   assert.strictEqual(describeExit(deactivated), "succeeded")
   assert.strictEqual(yield* space.activation, "Inactive")
-  assert.strictEqual(yield* services.runningWorkflowExecutions(parked), 1, "the retired execution waits for a runtime")
+  assert.strictEqual(yield* services.runningWorkflowExecutions(parked), 1, "the retired execution waits for a slot")
   return {
     services,
     replica,
@@ -76,7 +78,7 @@ const parkedAttempt = Effect.fnUntraced(function*() {
   }
 })
 
-describe("a workflow attempt that waits for its space to be activated again", () => {
+describe("a workflow attempt with nothing to send that waits for a background slot", () => {
   it.effect(
     "ends when the space is left and does not act for a later membership of the same space",
     Effect.fnUntraced(function*() {
