@@ -1236,8 +1236,9 @@ const makeLayer = <D extends Definition.Any, R,>(
           }
           if (!foreground && full) {
             slotWaiters.add(waiter)
+            const released = capacityChanged
             yield* yieldCatchUps
-            yield* restore(Completion.wait(capacityChanged))
+            yield* restore(Completion.wait(released))
             continue
           }
           break
